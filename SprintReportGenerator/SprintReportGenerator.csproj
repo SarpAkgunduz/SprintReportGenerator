@@ -6,6 +6,11 @@
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
+
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
+    <AssemblyTitle>Open Sprint Generator</AssemblyTitle>
+    <Product>Open Sprint Generator</Product>
+    <Description>Lightweight Jira-based sprint report generator</Description>
   </PropertyGroup>
 
   <ItemGroup>
@@ -16,4 +21,8 @@
     <Folder Include="Templates\" />
   </ItemGroup>
 
+ <ItemGroup>
+    <None Include="Assets\app.ico" />
+  </ItemGroup>
+  
 </Project>

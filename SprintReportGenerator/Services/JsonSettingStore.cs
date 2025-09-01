@@ -1,20 +1,11 @@
 ﻿using SprintReportGenerator.Models;
+using SprintReportGenerator.Services.Interfaces;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System;
-using System.IO;
-
 
 namespace SprintReportGenerator.Services
 {
-    public interface ISettingsStore
-    {
-        AppSettings Load();
-        void Save(AppSettings settings);
-        string Protect(string plain);     // encrypt token
-        string Unprotect(string cipher);  // decrypt token
-    }
     public sealed class JsonSettingsStore : ISettingsStore
     {
         private readonly string _settingsPath;
@@ -40,7 +31,6 @@ namespace SprintReportGenerator.Services
             File.WriteAllText(_settingsPath, json, Encoding.UTF8);
         }
 
-        // DPAPI (user scope): simple local encryption for token
         public string Protect(string plain)
         {
             if (string.IsNullOrEmpty(plain)) return string.Empty;

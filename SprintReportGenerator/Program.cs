@@ -12,22 +12,14 @@ namespace SprintReportGenerator
         static void Main()
         {
             ApplicationConfiguration.Initialize();
+        
+            using var login = new LoginForm();
+            if (login.ShowDialog() != DialogResult.OK)
+                return;
 
+            // Load settings after login
             var store = new JsonSettingsStore();
             var settings = store.Load();
-
-            bool canSkipLogin = settings.RememberMe
-                                && !string.IsNullOrWhiteSpace(settings.Email);
-
-            if (!canSkipLogin)
-            {
-                using var login = new LoginForm();
-                var result = login.ShowDialog();
-                if (result != DialogResult.OK) return;
-
-                // LoginForm içinde settings.json güncellendi
-                settings = store.Load();
-            }
 
             Application.Run(new MainForm(settings));
         }

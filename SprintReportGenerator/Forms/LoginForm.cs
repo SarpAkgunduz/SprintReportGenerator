@@ -1,13 +1,7 @@
 ﻿using SprintReportGenerator.Models;
 using SprintReportGenerator.Services;
+using SprintReportGenerator.Services.Interfaces;
 using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
-using System.Drawing;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace SprintReportGenerator.Forms
@@ -15,49 +9,63 @@ namespace SprintReportGenerator.Forms
     public partial class LoginForm : Form
     {
         private readonly JsonSettingsStore _store = new JsonSettingsStore();
+        private AppSettings _settings = new AppSettings();
 
         public LoginForm()
         {
             InitializeComponent();
-            LoadEmailFromSettings();
+
+            // Load settings
+            LoadSettings();
+
+            // Set form title and icon
+            const string AppTitle = "Open Sprint Generator";
+            this.Text = AppTitle;
+            try { this.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { /* ignore */ }
         }
 
-        private void LoadEmailFromSettings()
+        private void LoadSettings()
         {
-            AppSettings s = _store.Load();
+            _settings = _store.Load();
 
-            // Only prefill when RememberMe is true
-            chkRemember.Checked = s.RememberMe;
-            txtEmail.Text = s.RememberMe ? (s.Email ?? string.Empty) : string.Empty;
-            txtEmail.Focus();
+            txtEmail.Text = _settings.Email ?? string.Empty;
+            txtJiraUrl.Text = _settings.JiraUrl ?? string.Empty;
+            chkRememberMe.Checked = _settings.RememberMe;
+
+            // decrypt for UI (istersen masked bırak)
+            var plainToken = _store.Unprotect(_settings.EncApiToken);
+            txtApiToken.Text = plainToken ?? string.Empty;
+            // txtApiToken.UseSystemPasswordChar = true;
         }
 
         private void btnContinue_Click(object sender, EventArgs e)
         {
-            AppSettings s = _store.Load();
+            // 1) Validation (SERVİSİ DOĞRUDAN KULLAN)
+            var email = txtEmail.Text?.Trim();
+            var jira = txtJiraUrl.Text?.Trim();
 
-            if (chkRemember.Checked)
+            var (ok, error) = ValidationService.ValidateLoginFormInputs(email, jira);
+            if (!ok)
             {
-                s.Email = txtEmail.Text?.Trim() ?? string.Empty;
-                s.RememberMe = true;
-            }
-            else
-            {
-                // Clear remembered email if user doesn’t want to remember
-                s.Email = string.Empty;
-                s.RememberMe = false;
+                MessageBox.Show(error, "Validation Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
             }
 
-            _store.Save(s);
+            // 2) Save settings
+            _settings.Email = email ?? string.Empty;
+            _settings.JiraUrl = (jira ?? string.Empty).TrimEnd('/'); // normalize: sondaki '/' gider
+            _settings.RememberMe = chkRememberMe.Checked;
+
+            // 3) Encrypt and store token
+            var plain = txtApiToken.Text?.Trim() ?? string.Empty;
+            _settings.EncApiToken = _store.Protect(plain);
+            plain = string.Empty; // (opsiyonel) hafızayı temizle
+
+            _store.Save(_settings);
 
             this.DialogResult = DialogResult.OK;
             this.Close();
-        }
-
-
-        private void checkBox1_CheckedChanged(object sender, EventArgs e)
-        {
-
         }
     }
 }
