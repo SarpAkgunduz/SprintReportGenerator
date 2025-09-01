@@ -159,7 +159,11 @@ namespace SprintReportGenerator.Services
                 part.Settings.AppendChild(new UpdateFieldsOnOpen { Val = true });
             else
                 upd.Val = true;
+
+            // ensure the setting is persisted
+            part.Settings.Save();
         }
+
 
         // Bullet paragraph without numbering part (uses • character + küçük girinti)
         private static Paragraph MakeBulletParagraph(string text)

@@ -173,6 +173,7 @@ namespace SprintReportGenerator.Forms
 
                 MessageBox.Show($"Report created successfully:\n{output}", "Success",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
+                System.Diagnostics.Debug.WriteLine($"[DEBUG] Sprint dates: '{sprintStartTr}' - '{sprintEndTr}'");
 
                 if (chkOpenAfterGenerate.Checked && File.Exists(output))
                 {
@@ -183,6 +184,7 @@ namespace SprintReportGenerator.Forms
                     });
                 }
             }
+
             catch (IOException ioEx)
             {
                 MessageBox.Show($"File error:\n{ioEx.Message}", "Error",
