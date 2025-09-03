@@ -1,9 +1,9 @@
-﻿using DocumentFormat.OpenXml.Bibliography;
-using SprintReportGenerator.Models;
+﻿using SprintReportGenerator.Models;
 using SprintReportGenerator.Services;
 using SprintReportGenerator.Services.Interfaces;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
@@ -21,10 +21,8 @@ namespace SprintReportGenerator.Forms
         private readonly OpenXmlTemplateProcessor _report = new OpenXmlTemplateProcessor();
         private readonly ISettingsStore _store = new JsonSettingsStore();
 
-        // Two-column ListView (use your Designer control)
-        private ListView lvIssues;
+        private ListView lvIssues; // two-column list (Issue Type | Key)
 
-        // Auto-preview infra
         private System.Windows.Forms.Timer _autoPreviewTimer;
         private CancellationTokenSource? _activeLoadCts;
 
@@ -33,19 +31,15 @@ namespace SprintReportGenerator.Forms
             InitializeComponent();
             _settings = settings ?? new AppSettings();
 
-            // Form title and icon
             const string AppTitle = "Open Sprint Generator";
             this.Text = AppTitle;
             try { this.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
-            // Wire only Generate
             btnGenerate.Click -= btnGenerate_Click;
             btnGenerate.Click += btnGenerate_Click;
 
-            // Use the existing Designer ListView (rename if your control name differs)
             lvIssues = issueList;
 
-            // Two-column view (Issue Type | Key)
             lvIssues.View = View.Details;
             lvIssues.FullRowSelect = true;
             lvIssues.GridLines = true;
@@ -57,18 +51,15 @@ namespace SprintReportGenerator.Forms
             lvIssues.Columns.Add("Issue Type", 160, HorizontalAlignment.Left);
             lvIssues.Columns.Add("Key", 140, HorizontalAlignment.Left);
 
-            // StatusStrip progress defaults
             tsProg.Style = ProgressBarStyle.Marquee;
             tsProg.MarqueeAnimationSpeed = 30;
             tsProg.Visible = false;
 
-            // Preload
             if (txtSprintName != null) txtSprintName.Text = _settings.SprintName ?? string.Empty;
             if (txtMemberName != null) txtMemberName.Text = _settings.MemberName ?? string.Empty;
             if (txtProjectName != null) txtProjectName.Text = _settings.ProjectName ?? string.Empty;
             chkOpenAfterGenerate.Checked = _settings.OpenAfterGenerate;
 
-            // Debounce timer
             _autoPreviewTimer = new System.Windows.Forms.Timer { Interval = 500 };
             _autoPreviewTimer.Tick += async (_, __) =>
             {
@@ -76,16 +67,14 @@ namespace SprintReportGenerator.Forms
                 await LoadIssuesAsync();
             };
 
-            // Trigger on text changes
             if (txtProjectName != null) txtProjectName.TextChanged += ProjectOrSprint_Changed;
             if (txtSprintName != null) txtSprintName.TextChanged += ProjectOrSprint_Changed;
 
-            // First load (does nothing if project is empty)
             this.Shown += async (_, __) => await LoadIssuesAsync();
         }
 
         // =========================
-        // Generate report (filtered to Bug/Improvement/Story)
+        // Generate report (Bug/Improvement/Story)
         // =========================
         private async void btnGenerate_Click(object? sender, EventArgs e)
         {
@@ -117,11 +106,10 @@ namespace SprintReportGenerator.Forms
                     return;
                 }
 
-                // >>> Keep these OUTSIDE so they are visible below <<<
                 IReadOnlyList<JiraIssue> issues = Array.Empty<JiraIssue>();
                 string sprintStartTr = string.Empty, sprintEndTr = string.Empty;
 
-                // Fetch issues and (best-effort) sprint date range
+                // Fetch issues and (best-effort) sprint dates
                 if (!string.IsNullOrWhiteSpace(_settings.Email) &&
                     !string.IsNullOrWhiteSpace(_settings.JiraUrl) &&
                     !string.IsNullOrWhiteSpace(_settings.EncApiToken))
@@ -132,32 +120,38 @@ namespace SprintReportGenerator.Forms
                         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(25));
                         using var client = new JiraClient(_settings.JiraUrl.TrimEnd('/'), _settings.Email, token);
 
-                        // Issues for report
+                        // Get issues for this sprint (unfiltered first)
                         var jql = JqlBuilder.SprintIssues(projectName, sprintName);
                         var raw = await client.SearchIssuesAsync(jql, cts.Token).ConfigureAwait(true);
 
                         // Keep only Bug/Improvement/Story for the report
                         var allowed = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                             { "Bug", "Improvement", "Story" };
-
                         issues = raw.Where(i => allowed.Contains(i.Type)).ToArray();
 
-                        // Try to fetch sprint date range (Turkish formatting) — best effort
+                        // Derive project KEY (e.g., AIRPMD) from any issue key if available
+                        string projectKeyOrId = projectName;
+                        var keyCandidate = raw.FirstOrDefault()?.Key
+                                           ?? issues.FirstOrDefault()?.Key
+                                           ?? string.Empty;
+                        var dash = keyCandidate.IndexOf('-');
+                        if (dash > 0) projectKeyOrId = keyCandidate.Substring(0, dash);
+
+                        // Try to resolve sprint date range
                         try
                         {
                             var (start, end) = await client
-                                .TryGetSprintDatesAsync(projectName, sprintName, cts.Token)
+                                .TryGetSprintDatesAsync(projectKeyOrId, sprintName, cts.Token)
                                 .ConfigureAwait(true);
 
                             var tr = new CultureInfo("tr-TR");
                             if (start.HasValue) sprintStartTr = start.Value.ToString("d MMMM yyyy", tr);
                             if (end.HasValue) sprintEndTr = end.Value.ToString("d MMMM yyyy", tr);
                         }
-                        catch { /* ignore */ }
+                        catch { /* best-effort */ }
                     }
                 }
 
-                // Prepare template data
                 var data = new TemplateData
                 {
                     ReportDate = DateTime.Today.ToString("dd.MM.yyyy", new CultureInfo("en-US")),
@@ -168,23 +162,20 @@ namespace SprintReportGenerator.Forms
                     SprintEndDate = sprintEndTr
                 };
 
-                // Generate
                 string output = _report.Generate(template, data, issues);
 
                 MessageBox.Show($"Report created successfully:\n{output}", "Success",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
-                System.Diagnostics.Debug.WriteLine($"[DEBUG] Sprint dates: '{sprintStartTr}' - '{sprintEndTr}'");
 
                 if (chkOpenAfterGenerate.Checked && File.Exists(output))
                 {
-                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                    Process.Start(new ProcessStartInfo
                     {
                         FileName = output,
                         UseShellExecute = true
                     });
                 }
             }
-
             catch (IOException ioEx)
             {
                 MessageBox.Show($"File error:\n{ioEx.Message}", "Error",
@@ -196,7 +187,6 @@ namespace SprintReportGenerator.Forms
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
-
 
         // =========================
         // Auto-preview (project required; sprint optional)
@@ -225,7 +215,7 @@ namespace SprintReportGenerator.Forms
 
         private void FillIssues(IEnumerable<JiraIssue>? issues)
         {
-            // Two columns only: Issue Type | Key
+            // Show: Issue Type | Key
             lvIssues.BeginUpdate();
             lvIssues.Items.Clear();
 
@@ -233,8 +223,8 @@ namespace SprintReportGenerator.Forms
             {
                 foreach (var issue in issues)
                 {
-                    var item = new ListViewItem(issue.Type ?? string.Empty); // 1) Issue Type
-                    item.SubItems.Add(issue.Key ?? string.Empty);            // 2) Key
+                    var item = new ListViewItem(issue.Type ?? string.Empty);
+                    item.SubItems.Add(issue.Key ?? string.Empty);
                     lvIssues.Items.Add(item);
                 }
             }
@@ -245,12 +235,10 @@ namespace SprintReportGenerator.Forms
 
         private async Task LoadIssuesAsync()
         {
-            // Cancel previous load
             _activeLoadCts?.Cancel();
             _activeLoadCts = new CancellationTokenSource(TimeSpan.FromSeconds(25));
             var token = _activeLoadCts.Token;
 
-            // Fill only if project is provided
             if (string.IsNullOrWhiteSpace(ProjectNameText))
             {
                 lvIssues.Items.Clear();
@@ -258,7 +246,6 @@ namespace SprintReportGenerator.Forms
                 return;
             }
 
-            // Settings check
             if (string.IsNullOrWhiteSpace(_settings.Email) ||
                 string.IsNullOrWhiteSpace(_settings.JiraUrl) ||
                 string.IsNullOrWhiteSpace(_settings.EncApiToken))
@@ -290,14 +277,12 @@ namespace SprintReportGenerator.Forms
 
                 if (!string.IsNullOrWhiteSpace(SprintNameText))
                 {
-                    // Project + Sprint => only Bug/Improvement/Story for that sprint
                     var types = new[] { "Bug", "Improvement", "Story" };
                     issues = await client.SearchIssuesByProjectAndSprintAsync(
                         ProjectNameText, SprintNameText, types, token);
                 }
                 else
                 {
-                    // Only Project => latest issues for that project (no sprint)
                     issues = await client.SearchIssuesByProjectAsync(
                         ProjectNameText, take: 50, issueTypes: null, ct: token);
                 }
@@ -314,7 +299,6 @@ namespace SprintReportGenerator.Forms
                     return;
                 }
 
-                // Show only Issue Type | Key in the debug/validate list
                 FillIssues(issues);
                 SetJiraStatus($"Jira: {count} issues", Color.ForestGreen);
             }

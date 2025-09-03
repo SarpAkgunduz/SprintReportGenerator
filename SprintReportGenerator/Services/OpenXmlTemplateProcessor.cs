@@ -10,7 +10,10 @@ using static SprintReportGenerator.Services.JiraClient;
 namespace SprintReportGenerator.Services
 {
     /// <summary>
-    /// Generates the report from a template: replaces basic fields, appends SUMMARY and 3 tables.
+    /// Generates the report from a DOCX template:
+    /// - replaces basic tokens
+    /// - appends a Turkish summary section
+    /// - appends three tables (all issues, Bugs, Improvements)
     /// </summary>
     public class OpenXmlTemplateProcessor
     {
@@ -26,7 +29,7 @@ namespace SprintReportGenerator.Services
             string output = Path.Combine(outDir, $"Sprint {safeSprint} {safeProj} Test Kapanış Raporu.docx");
             File.Copy(templatePath, output, true);
 
-            // Allowed types (Bug / Improvement / Story)
+            // Allowed types to include in report tables
             var allowed = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { "Bug", "Improvement", "Story" };
 
@@ -40,25 +43,25 @@ namespace SprintReportGenerator.Services
 
                 var body = doc.MainDocumentPart!.Document.Body ?? (doc.MainDocumentPart.Document.Body = new Body());
 
-                // --- Replace placeholders (only these four) ---
+                // Token replacements (keep these placeholders in template)
                 ReplaceToken(body, "{{PROJECT}}", data.ProjectName ?? "");
                 ReplaceToken(body, "{{FORM_DATE}}", data.ReportDate ?? "");
                 ReplaceToken(body, "{{MEMBER_NAME}}", data.MemberName ?? "");
                 ReplaceToken(body, "{{SPRINT}}", data.SprintName ?? "");
 
-                // --- SUMMARY (before tables) ---
+                // Summary (uses TemplateData.SprintStartDate / SprintEndDate if present)
                 AppendSummaryTrSection(body, data, filtered);
 
-                // --- Tables ---
+                // Tables
                 AppendSection(doc, body, "Test Senaryo durumları", filtered, headingLevel: 2);
 
                 AppendSection(doc, body, "Sprint Kapsamında Açılan Buglar",
-                             filtered.Where(i => i.Type.Equals("Bug", StringComparison.OrdinalIgnoreCase)),
-                             headingLevel: 2);
+                    filtered.Where(i => i.Type.Equals("Bug", StringComparison.OrdinalIgnoreCase)),
+                    headingLevel: 2);
 
                 AppendSection(doc, body, "Sprint Kapsamında Açılan Improvement Kayıtları",
-                             filtered.Where(i => i.Type.Equals("Improvement", StringComparison.OrdinalIgnoreCase)),
-                             headingLevel: 2);
+                    filtered.Where(i => i.Type.Equals("Improvement", StringComparison.OrdinalIgnoreCase)),
+                    headingLevel: 2);
 
                 doc.MainDocumentPart.Document.Save();
             }
@@ -66,7 +69,7 @@ namespace SprintReportGenerator.Services
             return output;
         }
 
-        // Robust token replacement across split runs (w:t)
+        // Robust token replacement across split runs (handles placeholders split over multiple w:t)
         private static void ReplaceToken(Body body, string token, string value)
         {
             if (body == null || string.IsNullOrEmpty(token)) return;
@@ -95,7 +98,7 @@ namespace SprintReportGenerator.Services
         }
 
         /// <summary>
-        /// Appends a section to the specified WordprocessingDocument body, including a heading and a table of Jira issues.
+        /// Appends a section with a heading and a table of Jira issues.
         /// </summary>
         private static void AppendSection(WordprocessingDocument doc, Body body, string heading, IEnumerable<JiraIssue> source, int headingLevel = 2)
         {
@@ -109,12 +112,11 @@ namespace SprintReportGenerator.Services
         }
 
         /// <summary>
-        /// Creates a paragraph styled as a heading with the specified text and heading level.
+        /// Creates a built-in heading paragraph (Heading1..Heading9) with bold text.
         /// </summary>
         private static Paragraph MakeHeadingParagraph(string text, int level = 2)
         {
-            // clamp 1..9  (Heading1..Heading9)
-            level = Math.Max(1, Math.Min(level, 9));
+            level = Math.Max(1, Math.Min(level, 9)); // clamp to 1..9
 
             var run = new Run(new Text(text ?? string.Empty))
             {
@@ -122,31 +124,19 @@ namespace SprintReportGenerator.Services
             };
 
             var p = new Paragraph(run);
-            var props = new ParagraphProperties();
-
-            // Built-in heading style (TOC \o "1-3" uses this)
-            props.ParagraphStyleId = new ParagraphStyleId { Val = $"Heading{level}" };
-
-            // Fallback: also set outline level (0 = H1, 1 = H2, ...)
-            props.OutlineLevel = new OutlineLevel { Val = (byte)(level - 1) };
+            var props = new ParagraphProperties
+            {
+                ParagraphStyleId = new ParagraphStyleId { Val = $"Heading{level}" },
+                // Fallback outline level: 0=H1, 1=H2, ...
+                OutlineLevel = new OutlineLevel { Val = (byte)(level - 1) }
+            };
 
             p.ParagraphProperties = props;
             return p;
         }
 
-        // Builds a Turkish breakdown like: "8’i Closed, 1’i Cancelled" and skips zeros.
-        private static string BuildBreakdownTr(int closed, int cancelled, int inProgress, int inQa)
-        {
-            var parts = new List<string>(4);
-            if (closed > 0) parts.Add($"{closed}’i Closed");
-            if (cancelled > 0) parts.Add($"{cancelled}’i Cancelled");
-            if (inProgress > 0) parts.Add($"{inProgress}’i In Progress");
-            if (inQa > 0) parts.Add($"{inQa}’i In Q&A");
-            return string.Join(", ", parts);
-        }
-
         /// <summary>
-        /// Enables the automatic updating of fields when the WordprocessingDocument is opened.
+        /// Ensures Word updates fields (e.g., TOC) on open.
         /// </summary>
         private static void EnableUpdateFieldsOnOpen(WordprocessingDocument doc)
         {
@@ -160,12 +150,10 @@ namespace SprintReportGenerator.Services
             else
                 upd.Val = true;
 
-            // ensure the setting is persisted
             part.Settings.Save();
         }
 
-
-        // Bullet paragraph without numbering part (uses • character + küçük girinti)
+        // Simple bullet paragraph (uses • + small hanging indent)
         private static Paragraph MakeBulletParagraph(string text)
         {
             var p = new Paragraph(new Run(new Text("• " + (text ?? string.Empty))
@@ -174,25 +162,22 @@ namespace SprintReportGenerator.Services
             }));
 
             p.ParagraphProperties = new ParagraphProperties(
-                new Indentation { Left = "720", Hanging = "360" }   // ~0.5" girinti, okunur görünüm
+                new Indentation { Left = "720", Hanging = "360" } // ~0.5" indent
             );
 
             return p;
         }
 
-        // ======= SUMMARY (TR) =======
-        // ======= SUMMARY (TR) =======
+        // ===== SUMMARY (Turkish text) =====
         private static void AppendSummaryTrSection(Body body, Models.TemplateData data, List<JiraIssue> items)
         {
-            // Add summary heading so it shows up in TOC
             body.AppendChild(MakeHeadingParagraph("Özet", 2));
 
-            // Build readable date lead:
-            // both present : "12 Mayıs 2025 – 26 Mayıs 2025 tarihleri arasında"
-            // only start   : "12 Mayıs 2025 tarihinden itibaren"
-            // only end     : "26 Mayıs 2025 tarihine kadar"
-            // none         : "" (omit)
-            string BuildDateLead(string start, string end)
+            // Human-readable date lead:
+            // both:  "<start> – <end> tarihleri arasında"
+            // start: "<start> tarihinden itibaren"
+            // end:   "<end> tarihine kadar"
+            static string BuildDateLead(string start, string end)
             {
                 bool hasStart = !string.IsNullOrWhiteSpace(start);
                 bool hasEnd = !string.IsNullOrWhiteSpace(end);
@@ -211,7 +196,6 @@ namespace SprintReportGenerator.Services
             int closed = items.Count(i => IsClosedStatus(i.Status));
 
             var envPrefix = "Proven Test ve Pre-production";
-            // Prefix with date lead only when present
             var prefix = string.IsNullOrEmpty(dateLead)
                 ? $"{envPrefix} ortamında koşulan "
                 : $"{dateLead} {envPrefix} ortamında koşulan ";
@@ -219,11 +203,10 @@ namespace SprintReportGenerator.Services
             var p1 = $"{prefix}{proj} projesi {sprint} sprintine ait {total} kayıt bulunmaktadır. Bunlardan {closed}’i Closed durumundadır.";
             body.AppendChild(new Paragraph(new Run(new Text(p1) { Space = SpaceProcessingModeValues.Preserve })));
 
-            // Existing heading stays as-is
             body.AppendChild(MakeHeadingParagraph("Test genel, hata bildirimi ve iyileştirme durumu", 2));
 
-            // bullets by type (unchanged)
-            static string BreakdownTr(int cl, int cn, int ip, int iq, int bl)
+            // Type breakdown bullets
+            static string BreakdownTr(int cl, int cn, int ip, int iq, int bl, int op, int de)
             {
                 var parts = new List<string>(5);
                 if (cl > 0) parts.Add($"{cl}’i Closed");
@@ -231,6 +214,8 @@ namespace SprintReportGenerator.Services
                 if (ip > 0) parts.Add($"{ip}’i In Progress");
                 if (iq > 0) parts.Add($"{iq}’i In Q&A");
                 if (bl > 0) parts.Add($"{bl}’i Blocked");
+                if (op > 0) parts.Add($"{op}’i Open");
+                if (de > 0) parts.Add($"{de}’i Dev Completed");
                 return string.Join(", ", parts);
             }
 
@@ -239,14 +224,16 @@ namespace SprintReportGenerator.Services
                 var list = src.ToList();
                 if (list.Count == 0) return;
 
+                int op = list.Count(i => IsOpenStatus(i.Status));
                 int cl = list.Count(i => IsClosedStatus(i.Status));
+                int de = list.Count(i => IsDevCompletedStatus(i.Status));
                 int cn = list.Count(i => IsCancelledStatus(i.Status));
                 int ip = list.Count(i => IsInProgressStatus(i.Status));
                 int iq = list.Count(i => IsInQaStatus(i.Status));
                 int bl = list.Count(i => IsBlockedStatus(i.Status));
 
                 var line = $"{prefixText} {list.Count} adet {label} yapılmıştır.";
-                var b = BreakdownTr(cl, cn, ip, iq, bl);
+                var b = BreakdownTr(cl, cn, ip, iq, bl, op, de);
                 if (!string.IsNullOrWhiteSpace(b)) line += $" {b} durumundadır.";
                 body.AppendChild(MakeBulletParagraph(line));
             }
@@ -266,8 +253,7 @@ namespace SprintReportGenerator.Services
             body.AppendChild(new Paragraph(new Run(new Text(" "))));
         }
 
-
-
+        // ===== Table builders =====
         private static Table BuildIssuesTable(List<JiraIssue> items)
         {
             var table = new Table();
@@ -300,8 +286,7 @@ namespace SprintReportGenerator.Services
             {
                 var row = new TableRow();
                 var cell = MakeCell("(No issues)");
-                if (cell.TableCellProperties == null)
-                    cell.TableCellProperties = new TableCellProperties();
+                cell.TableCellProperties ??= new TableCellProperties();
                 cell.TableCellProperties.GridSpan = new GridSpan { Val = 5 };
                 row.Append(cell);
                 table.Append(row);
@@ -336,24 +321,22 @@ namespace SprintReportGenerator.Services
                 new TableCellVerticalAlignment { Val = TableVerticalAlignmentValues.Center },
                 new Shading
                 {
-                    Fill = ColorGrayHeader,              // darker than blocked
+                    Fill = ColorGrayHeader,
                     Val = ShadingPatternValues.Clear,
                     Color = "auto"
                 });
 
-            var cell = new TableCell(p) { TableCellProperties = cellProps };
-            return cell;
+            return new TableCell(p) { TableCellProperties = cellProps };
         }
 
         private static TableCell MakeCell(string text)
         {
             var p = new Paragraph(new Run(new Text(text ?? string.Empty)));
-            var cell = new TableCell(p)
+            return new TableCell(p)
             {
                 TableCellProperties = new TableCellProperties(
                     new TableCellVerticalAlignment { Val = TableVerticalAlignmentValues.Center })
             };
-            return cell;
         }
 
         private static TableCell MakeStatusCell(string status)
@@ -361,29 +344,30 @@ namespace SprintReportGenerator.Services
             var fill = GetStatusFill(status);
 
             var p = new Paragraph(new Run(new Text(status ?? string.Empty)));
-            var cell = new TableCell(p);
-
-            cell.TableCellProperties = new TableCellProperties(
-                new TableCellVerticalAlignment { Val = TableVerticalAlignmentValues.Center },
-                new Shading
-                {
-                    Fill = fill,
-                    Val = ShadingPatternValues.Clear,
-                    Color = "auto"
-                });
+            var cell = new TableCell(p)
+            {
+                TableCellProperties = new TableCellProperties(
+                    new TableCellVerticalAlignment { Val = TableVerticalAlignmentValues.Center },
+                    new Shading
+                    {
+                        Fill = fill,
+                        Val = ShadingPatternValues.Clear,
+                        Color = "auto"
+                    })
+            };
 
             return cell;
         }
 
-        // ======= STATUS helpers & color mapping =======
-        // ---- status colors ----
-        private const string ColorGreenClosed = "92D050"; // closed
-        private const string ColorBlueCancel = "1E90FF"; // cancelled/FPA
-        private const string ColorYellowOpen = "FFFF00"; // others
-        private const string ColorGrayBlocked = "C9C9C9"; // blocked cells
-        private const string ColorGrayHeader = "A6A6A6"; // header (daha koyu)
+        // ===== Status helpers & colors =====
+        private const string ColorGreenClosed = "92D050"; // Closed
+        private const string ColorBlueCancel = "1E90FF"; // Cancelled/FPA
+        private const string ColorYellowOpen = "FFFF00"; // Others
+        private const string ColorGrayBlocked = "C9C9C9"; // Blocked cells
+        private const string ColorGrayHeader = "A6A6A6"; // Header shade
 
-        // already existing helpers:
+        private static bool IsOpenStatus(string? s) => !string.IsNullOrWhiteSpace(s) &&
+            (s!.Trim().Equals("Open", StringComparison.OrdinalIgnoreCase));
         private static bool IsClosedStatus(string? s) => !string.IsNullOrWhiteSpace(s) &&
             (s!.Trim().Equals("Closed", StringComparison.OrdinalIgnoreCase) ||
              s.Trim().Equals("Done", StringComparison.OrdinalIgnoreCase));
@@ -394,8 +378,10 @@ namespace SprintReportGenerator.Services
              s.Trim().Equals("False Positive Approval", StringComparison.OrdinalIgnoreCase));
 
         private static bool IsInProgressStatus(string? s) => !string.IsNullOrWhiteSpace(s) &&
-            (s!.Trim().Equals("In Progress", StringComparison.OrdinalIgnoreCase) ||
-             s.Trim().Equals("Dev Completed", StringComparison.OrdinalIgnoreCase));
+            (s!.Trim().Equals("In Progress", StringComparison.OrdinalIgnoreCase));
+
+        private static bool IsDevCompletedStatus(string? s) => !string.IsNullOrWhiteSpace(s) &&
+            (s!.Trim().Equals("Dev Completed", StringComparison.OrdinalIgnoreCase));
 
         private static bool IsInQaStatus(string? s) => !string.IsNullOrWhiteSpace(s) &&
             (s!.Trim().Equals("In Q&A", StringComparison.OrdinalIgnoreCase) ||
@@ -404,7 +390,6 @@ namespace SprintReportGenerator.Services
         private static bool IsBlockedStatus(string? s) =>
             !string.IsNullOrWhiteSpace(s) && s!.Trim().Equals("Blocked", StringComparison.OrdinalIgnoreCase);
 
-        // use helpers here
         private static string GetStatusFill(string status)
         {
             if (IsClosedStatus(status)) return ColorGreenClosed;
@@ -412,11 +397,11 @@ namespace SprintReportGenerator.Services
             if (IsBlockedStatus(status)) return ColorGrayBlocked;
             return ColorYellowOpen;
         }
-
     }
 
     internal static class PathSafeExtensions
     {
+        // Replaces any of the provided characters in the string with a given char
         public static string Replace(this string s, char[] chars, char withChar)
         {
             if (string.IsNullOrEmpty(s)) return s;
