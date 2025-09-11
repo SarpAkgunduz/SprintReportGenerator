@@ -11,12 +11,15 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using static System.Net.WebRequestMethods;
 
 namespace SprintReportGenerator.Services
 {
     /// <summary>
-    /// Minimal Jira client for issue search and sprint date lookups.
-    /// Dual auth (Basic/Bearer), REST v3/v2 fallbacks, and Agile API helpers.
+    /// Minimal Jira client for issue search and sprint metadata.
+    /// - Supports Basic (email:apiToken) and Bearer (PAT) auth
+    /// - Uses Agile (greenhopper) Sprint Report for exact key sets
+    /// - Falls back to REST v3/v2 JQL when necessary
     /// </summary>
     public class JiraClient : IDisposable
     {
@@ -50,7 +53,7 @@ namespace SprintReportGenerator.Services
             _authBasic = new AuthenticationHeaderValue("Basic", basic);
             _authBearer = new AuthenticationHeaderValue("Bearer", apiToken);
 
-            _http.DefaultRequestHeaders.Authorization = _authBasic;
+            _http.DefaultRequestHeaders.Authorization = _authBasic; // start with Basic
             _http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
             _http.DefaultRequestHeaders.UserAgent.ParseAdd("SprintReportGenerator/1.0");
         }
@@ -58,10 +61,8 @@ namespace SprintReportGenerator.Services
         // DTO order: Project, Type, Key, Summary, Status
         public record JiraIssue(string Project, string Type, string Key, string Summary, string Status);
 
-        /// <summary>
-        /// Execute a JQL search. Tries v3 then v2 under both Basic and Bearer auth.
-        /// Returns empty list on failure or when no issues are found.
-        /// </summary>
+        // ========= PUBLIC SEARCH APIS =========
+
         public async Task<IReadOnlyList<JiraIssue>> SearchIssuesAsync(string jql, CancellationToken ct = default)
         {
             var fields = "summary,issuetype,status,project";
@@ -78,60 +79,9 @@ namespace SprintReportGenerator.Services
                 list = await TrySearch(urlV2, ct).ConfigureAwait(false);
                 if (list is { Count: > 0 }) return list!;
             }
-
             return Array.Empty<JiraIssue>();
         }
 
-        /// <summary>
-        /// Search issues by project and sprint (optional type filter).
-        /// Builds robust JQL variants (id/name, quoted/unquoted, numeric).
-        /// </summary>
-        public Task<IReadOnlyList<JiraIssue>> SearchIssuesByProjectAndSprintAsync(
-            string project, string sprintText, CancellationToken ct = default)
-            => SearchIssuesByProjectAndSprintAsync(project, sprintText, null, ct);
-
-        public async Task<IReadOnlyList<JiraIssue>> SearchIssuesByProjectAndSprintAsync(
-            string project, string sprintText, IEnumerable<string>? issueTypes, CancellationToken ct = default)
-        {
-            static string Esc(string? s) => (s ?? string.Empty).Replace("\"", "\\\"");
-            bool projectLooksLikeKey = Regex.IsMatch(project ?? string.Empty, @"^[A-Z0-9_]+$");
-            string projectClause = projectLooksLikeKey ? $"project = {project}" : $"project = \"{Esc(project)}\"";
-            var typeClause = BuildIssueTypeClause(issueTypes);
-
-            var jqls = new List<string>(capacity: 12);
-
-            var sid = await ResolveSprintIdAsync(project ?? string.Empty, sprintText ?? string.Empty, ct).ConfigureAwait(false);
-            if (sid.HasValue)
-            {
-                jqls.Add($"{projectClause} AND sprint = {sid.Value}{typeClause} ORDER BY updated DESC");
-                jqls.Add($"sprint = {sid.Value}{typeClause} ORDER BY updated DESC");
-            }
-
-            if (int.TryParse(sprintText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var num))
-            {
-                jqls.Add($"{projectClause} AND sprint = {num}{typeClause} ORDER BY updated DESC");
-                jqls.Add($"sprint = {num}{typeClause} ORDER BY updated DESC");
-            }
-
-            var m = Regex.Match(sprintText ?? string.Empty, @"\d+");
-            if (m.Success && int.TryParse(m.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var numFromText))
-            {
-                jqls.Add($"{projectClause} AND sprint = {numFromText}{typeClause} ORDER BY updated DESC");
-                jqls.Add($"sprint = {numFromText}{typeClause} ORDER BY updated DESC");
-            }
-
-            jqls.Add($"{projectClause} AND sprint = \"{Esc(sprintText)}\"{typeClause} ORDER BY updated DESC");
-            jqls.Add($"sprint = \"{Esc(sprintText)}\"{typeClause} ORDER BY updated DESC");
-
-            jqls.Add($"{projectClause} AND sprint in openSprints(){typeClause} ORDER BY updated DESC");
-            jqls.Add($"{projectClause} AND sprint in closedSprints(){typeClause} ORDER BY updated DESC");
-
-            return await TryFirstNonEmptyAsync(jqls, ct).ConfigureAwait(false);
-        }
-
-        /// <summary>
-        /// Search latest issues by project only (no sprint). Returns up to 'take' results ordered by updated desc.
-        /// </summary>
         public async Task<IReadOnlyList<JiraIssue>> SearchIssuesByProjectAsync(
             string project, int take = 50, IEnumerable<string>? issueTypes = null, CancellationToken ct = default)
         {
@@ -148,71 +98,221 @@ namespace SprintReportGenerator.Services
         }
 
         /// <summary>
-        /// Resolve sprint id by matching name or trailing number against Agile API sprint list.
+        /// STRICT sprint search:
+        /// 1) Collect ALL candidate (boardId,sprintId) pairs matching the sprint (exact name first, then numeric).
+        /// 2) For each candidate, read Sprint Report and extract official keys. Choose the first that yields keys.
+        /// 3) If none yields keys, fall back to "sprint = {id}" (no open/closed fallbacks).
         /// </summary>
-        public async Task<long?> ResolveSprintIdAsync(string projectKeyOrId, string sprintText, CancellationToken ct = default)
+        public async Task<IReadOnlyList<JiraIssue>> SearchIssuesByProjectAndSprintAsync(
+            string project, string sprintText, IEnumerable<string>? issueTypes, CancellationToken ct = default)
         {
+            var dbg = new List<string>
+            {
+                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] STRICT SEARCH project='{project}', sprintText='{sprintText}'"
+            };
+
+            static string Esc(string? s) => (s ?? string.Empty).Replace("\"", "\\\"");
+            static int? Num(string? s)
+            {
+                if (string.IsNullOrWhiteSpace(s)) return null;
+                var m = Regex.Match(s, @"\d+");
+                return m.Success ? int.Parse(m.Value) : (int?)null;
+            }
+
+            bool projectLooksLikeKey = Regex.IsMatch(project ?? string.Empty, @"^[A-Z0-9_]+$");
+            string projectClause = projectLooksLikeKey ? $"project = {project}" : $"project = \"{Esc(project)}\"";
+            var typeClause = BuildIssueTypeClause(issueTypes);
+            var wantNum = Num(sprintText);
+
+            // 1) Gather candidate board/sprint pairs
+            var candidates = new List<(int boardId, long sprintId, string name, DateTime? start, DateTime? end)>();
             try
             {
-                if (string.IsNullOrWhiteSpace(projectKeyOrId) || string.IsNullOrWhiteSpace(sprintText))
-                    return null;
-
-                var wantNum = TryParseAnyNumber(sprintText);
-
-                var boardsUrl = $"{_baseUrl}/rest/agile/1.0/board?projectKeyOrId={Uri.EscapeDataString(projectKeyOrId)}&maxResults=50";
-                using (var boardsResp = await _http.GetAsync(boardsUrl, ct).ConfigureAwait(false))
+                if (!string.IsNullOrWhiteSpace(project) && !string.IsNullOrWhiteSpace(sprintText))
                 {
-                    if (!boardsResp.IsSuccessStatusCode) return null;
+                    var boardsUrl = $"{_baseUrl}/rest/agile/1.0/board?projectKeyOrId={Uri.EscapeDataString(project)}&maxResults=50";
+                    using var bResp = await _http.GetAsync(boardsUrl, ct).ConfigureAwait(false);
+                    dbg.Add($"boards GET {bResp.StatusCode}");
 
-                    var boardsJson = await boardsResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-                    using var boardsDoc = JsonDocument.Parse(boardsJson);
-
-                    if (!boardsDoc.RootElement.TryGetProperty("values", out var boardsEl) || boardsEl.ValueKind != JsonValueKind.Array)
-                        return null;
-
-                    foreach (var b in boardsEl.EnumerateArray())
+                    if (bResp.IsSuccessStatusCode)
                     {
-                        if (!b.TryGetProperty("id", out var idEl)) continue;
-                        var boardId = idEl.GetInt32();
-
-                        var sUrl = $"{_baseUrl}/rest/agile/1.0/board/{boardId}/sprint?state=active,closed,future&maxResults=200";
-                        using var sResp = await _http.GetAsync(sUrl, ct).ConfigureAwait(false);
-                        if (!sResp.IsSuccessStatusCode) continue;
-
-                        var sJson = await sResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-                        using var sDoc = JsonDocument.Parse(sJson);
-                        if (!sDoc.RootElement.TryGetProperty("values", out var vals) || vals.ValueKind != JsonValueKind.Array)
-                            continue;
-
-                        foreach (var s in vals.EnumerateArray())
+                        using var bDoc = JsonDocument.Parse(await bResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+                        if (bDoc.RootElement.TryGetProperty("values", out var boards) && boards.ValueKind == JsonValueKind.Array)
                         {
-                            var name = s.TryGetProperty("name", out var n) ? (n.GetString() ?? string.Empty) : string.Empty;
-                            if (name.Length == 0) continue;
+                            foreach (var b in boards.EnumerateArray())
+                            {
+                                if (!b.TryGetProperty("id", out var idEl)) continue;
+                                var bid = idEl.GetInt32();
 
-                            bool match =
-                                name.Equals(sprintText, StringComparison.OrdinalIgnoreCase) ||
-                                name.Contains(sprintText, StringComparison.OrdinalIgnoreCase);
+                                var sUrl = $"{_baseUrl}/rest/agile/1.0/board/{bid}/sprint?state=active,closed,future&maxResults=500";
+                                using var sResp = await _http.GetAsync(sUrl, ct).ConfigureAwait(false);
+                                dbg.Add($"sprints(board={bid}) GET {sResp.StatusCode}");
+                                if (!sResp.IsSuccessStatusCode) continue;
 
-                            if (!match && wantNum.HasValue && TryGetTrailingNumber(name, out var tail) && tail == wantNum.Value)
-                                match = true;
+                                using var sDoc = JsonDocument.Parse(await sResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+                                if (!sDoc.RootElement.TryGetProperty("values", out var vals) || vals.ValueKind != JsonValueKind.Array)
+                                    continue;
 
-                            if (match)
-                                return s.TryGetProperty("id", out var sid) ? sid.GetInt32() : (int?)null;
+                                // collect exact-name matches first
+                                foreach (var s in vals.EnumerateArray())
+                                {
+                                    var name = s.TryGetProperty("name", out var n) ? (n.GetString() ?? "") : "";
+                                    if (name.Equals(sprintText, StringComparison.OrdinalIgnoreCase) &&
+                                        (!projectLooksLikeKey || name.IndexOf(project, StringComparison.OrdinalIgnoreCase) >= 0))
+                                    {
+                                        var sid = s.GetProperty("id").GetInt32();
+                                        var (st, en) = ReadDatesFromJsonObject(s);
+                                        candidates.Add((bid, sid, name, st, en));
+                                    }
+                                }
+
+                                // then numeric-equality matches (if none collected yet)
+                                if (candidates.Count == 0 && wantNum.HasValue)
+                                {
+                                    foreach (var s in vals.EnumerateArray())
+                                    {
+                                        var name = s.TryGetProperty("name", out var n) ? (n.GetString() ?? "") : "";
+                                        var mn = Regex.Match(name, @"\d+");
+                                        if (mn.Success && int.Parse(mn.Value) == wantNum.Value &&
+                                            (!projectLooksLikeKey || name.IndexOf(project, StringComparison.OrdinalIgnoreCase) >= 0))
+                                        {
+                                            var sid = s.GetInt32("id");
+                                            var (st, en) = ReadDatesFromJsonObject(s);
+                                            candidates.Add((bid, sid, name, st, en));
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // best-effort
+                dbg.Add("candidate collection EX: " + ex.Message);
             }
-            return null;
+
+            dbg.Add($"candidates: {candidates.Count}");
+            foreach (var c in candidates.Take(5))
+                dbg.Add($" - cand board={c.boardId} sprint={c.sprintId} name='{c.name}' start={c.start} end={c.end}");
+
+            // Helper: try get official keys for a candidate
+            async Task<HashSet<string>> TrySprintReportKeysAsync(int boardId, long sprintId)
+            {
+                var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    var url = $"{_baseUrl}/rest/greenhopper/1.0/rapid/charts/sprintreport?rapidViewId={boardId}&sprintId={sprintId}";
+                    using var r = await _http.GetAsync(url, ct).ConfigureAwait(false);
+                    dbg.Add($"sprintreport(board={boardId},sprint={sprintId}) -> {r.StatusCode}");
+                    if (!r.IsSuccessStatusCode) return keys;
+
+                    using var doc = JsonDocument.Parse(await r.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+                    if (!doc.RootElement.TryGetProperty("contents", out var contents)) return keys;
+
+                    ExtractKeysFromSprintReport(contents, keys);
+                }
+                catch (Exception ex)
+                {
+                    dbg.Add("sprintreport EX: " + ex.Message);
+                }
+                return keys;
+            }
+
+            int? chosenBoard = null;
+            long? chosenSprint = null;
+            var officialKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // 2) Prefer candidate whose Sprint Report yields keys
+            foreach (var cand in candidates)
+            {
+                var k = await TrySprintReportKeysAsync(cand.boardId, cand.sprintId);
+                if (k.Count > 0)
+                {
+                    chosenBoard = cand.boardId;
+                    chosenSprint = cand.sprintId;
+                    officialKeys = k;
+                    dbg.Add($"CHOSEN by keys: board={chosenBoard}, sprint={chosenSprint}, keys={officialKeys.Count}");
+                    break;
+                }
+            }
+
+            // If none gave keys but at least one candidate exists, pick the latest by start date
+            if (!chosenBoard.HasValue && candidates.Count > 0)
+            {
+                var pick = candidates
+                    .OrderByDescending(c => c.start ?? DateTime.MinValue)
+                    .First();
+                chosenBoard = pick.boardId;
+                chosenSprint = pick.sprintId;
+                dbg.Add($"CHOSEN by fallback-candidate: board={chosenBoard}, sprint={chosenSprint}");
+            }
+
+            // If still nothing, we try a generic resolve (older logic)
+            if (!chosenBoard.HasValue || !chosenSprint.HasValue)
+            {
+                var sid = await ResolveSprintIdAsync(project ?? string.Empty, sprintText ?? string.Empty, ct).ConfigureAwait(false);
+                if (sid.HasValue)
+                {
+                    chosenBoard = -1; // unknown
+                    chosenSprint = sid.Value;
+                    dbg.Add($"CHOSEN by ResolveSprintId fallback: sprint={chosenSprint}");
+                }
+            }
+
+            // 3) If we have official keys -> query strictly by keys
+            if (officialKeys.Count > 0)
+            {
+                dbg.Add("STRICT by official key set");
+                var list = await FetchIssuesByKeysAsync(officialKeys, ct).ConfigureAwait(false);
+
+                // also enforce project/type on client-side
+                var filtered = list.Where(i =>
+                    (projectLooksLikeKey
+                        ? (i.Key?.StartsWith(project + "-", StringComparison.OrdinalIgnoreCase) ?? false)
+                        : string.Equals(i.Project, project, StringComparison.OrdinalIgnoreCase)))
+                    .ToList();
+
+                if (issueTypes != null)
+                {
+                    var typeSet = new HashSet<string>(issueTypes.Where(t => !string.IsNullOrWhiteSpace(t)),
+                                                      StringComparer.OrdinalIgnoreCase);
+                    filtered = filtered.Where(i => typeSet.Contains(i.Type ?? string.Empty)).ToList();
+                }
+
+                dbg.Add($"RETURN keys={officialKeys.Count}, after filters={filtered.Count}");
+                WriteStrictDebug(dbg, officialKeys);
+                return filtered;
+            }
+
+            // 4) No key set -> fall back to sprint=id JQL (still project-scoped)
+            var results = new List<JiraIssue>();
+            if (chosenSprint.HasValue)
+            {
+                var jql = $"{projectClause} AND sprint = {chosenSprint.Value}{typeClause} ORDER BY updated DESC";
+                dbg.Add("FALLBACK JQL: " + jql);
+
+                results = (await SearchIssuesAsync(jql, ct).ConfigureAwait(false)).ToList();
+            }
+            else if (!string.IsNullOrWhiteSpace(sprintText))
+            {
+                var jql = $"{projectClause} AND sprint = \"{Esc(sprintText)}\"{typeClause} ORDER BY updated DESC";
+                dbg.Add("FALLBACK JQL (by name): " + jql);
+
+                results = (await SearchIssuesAsync(jql, ct).ConfigureAwait(false)).ToList();
+            }
+
+            dbg.Add($"RETURN fallback count={results.Count}");
+            WriteStrictDebug(dbg, null);
+            return results;
         }
 
-        /// <summary>
-        /// Try to get sprint start/end dates using Agile API. Matches by name or trailing number.
-        /// Falls back to sprint detail endpoint when list lacks dates, and to activated/complete dates if needed.
-        /// </summary>
+        public Task<IReadOnlyList<JiraIssue>> SearchIssuesByProjectAndSprintAsync(
+            string project, string sprintText, CancellationToken ct = default)
+            => SearchIssuesByProjectAndSprintAsync(project, sprintText, null, ct);
+
+        // ========= SPRINT DATES =========
+
         public async Task<(DateTime? start, DateTime? end)> TryGetSprintDatesAsync(
             string projectKeyOrId, string sprintText, CancellationToken ct = default)
         {
@@ -220,8 +320,6 @@ namespace SprintReportGenerator.Services
             {
                 if (string.IsNullOrWhiteSpace(projectKeyOrId) || string.IsNullOrWhiteSpace(sprintText))
                     return (null, null);
-
-                var wantNum = TryParseAnyNumber(sprintText);
 
                 var boardsUrl = $"{_baseUrl}/rest/agile/1.0/board?projectKeyOrId={Uri.EscapeDataString(projectKeyOrId)}&maxResults=50";
                 using var boardsResp = await _http.GetAsync(boardsUrl, ct).ConfigureAwait(false);
@@ -246,42 +344,100 @@ namespace SprintReportGenerator.Services
                     if (!sDoc.RootElement.TryGetProperty("values", out var vals) || vals.ValueKind != JsonValueKind.Array)
                         continue;
 
+                    int? wantNum = null;
+                    var mm = Regex.Match(sprintText, @"\d+");
+                    if (mm.Success) wantNum = int.Parse(mm.Value);
+
                     foreach (var s in vals.EnumerateArray())
                     {
                         var name = s.TryGetProperty("name", out var n) ? (n.GetString() ?? string.Empty) : string.Empty;
                         if (name.Length == 0) continue;
 
-                        bool match =
-                            name.Equals(sprintText, StringComparison.OrdinalIgnoreCase) ||
-                            name.Contains(sprintText, StringComparison.OrdinalIgnoreCase);
-
-                        if (!match && wantNum.HasValue && TryGetTrailingNumber(name, out var tail) && tail == wantNum.Value)
-                            match = true;
-
-                        if (match)
+                        bool match = name.Equals(sprintText, StringComparison.OrdinalIgnoreCase);
+                        if (!match && wantNum.HasValue)
                         {
-                            var sid = s.TryGetProperty("id", out var sidEl) ? (long?)sidEl.GetInt32() : null;
-                            var (start, end) = ReadDatesFromJsonObject(s);
-
-                            if ((!start.HasValue || !end.HasValue) && sid.HasValue)
-                            {
-                                var detail = await TryGetSprintDatesByIdAsync(sid.Value, ct).ConfigureAwait(false);
-                                if (detail.HasValue) return detail.Value;
-                            }
-                            return (start, end);
+                            var mn = Regex.Match(name, @"\d+");
+                            match = mn.Success && int.Parse(mn.Value) == wantNum.Value;
                         }
+                        if (!match) continue;
+
+                        var (start, end) = ReadDatesFromJsonObject(s);
+                        var sid = s.TryGetProperty("id", out var sidEl) ? (long?)sidEl.GetInt32() : null;
+
+                        if ((!start.HasValue || !end.HasValue) && sid.HasValue)
+                        {
+                            var detail = await TryGetSprintDatesByIdAsync(sid.Value, ct).ConfigureAwait(false);
+                            if (detail.HasValue) return detail.Value;
+                        }
+                        return (start, end);
                     }
                 }
             }
-            catch
-            {
-                // swallow
-            }
+            catch { /* swallow */ }
 
             return await TryByIdFallback(projectKeyOrId, sprintText, ct).ConfigureAwait(false);
         }
 
-        // ----- Internals -----
+        public async Task<long?> ResolveSprintIdAsync(string projectKeyOrId, string sprintText, CancellationToken ct = default)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(projectKeyOrId) || string.IsNullOrWhiteSpace(sprintText))
+                    return null;
+
+                int? wantNum = null;
+                var m = Regex.Match(sprintText, @"\d+");
+                if (m.Success) wantNum = int.Parse(m.Value);
+
+                var boardsUrl = $"{_baseUrl}/rest/agile/1.0/board?projectKeyOrId={Uri.EscapeDataString(projectKeyOrId)}&maxResults=50";
+                using var boardsResp = await _http.GetAsync(boardsUrl, ct).ConfigureAwait(false);
+                if (!boardsResp.IsSuccessStatusCode) return null;
+
+                var boardsJson = await boardsResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                using var boardsDoc = JsonDocument.Parse(boardsJson);
+                if (!boardsDoc.RootElement.TryGetProperty("values", out var boardsEl) || boardsEl.ValueKind != JsonValueKind.Array)
+                    return null;
+
+                foreach (var b in boardsEl.EnumerateArray())
+                {
+                    if (!b.TryGetProperty("id", out var idEl)) continue;
+                    var boardId = idEl.GetInt32();
+
+                    var sUrl = $"{_baseUrl}/rest/agile/1.0/board/{boardId}/sprint?state=active,closed,future&maxResults=200";
+                    using var sResp = await _http.GetAsync(sUrl, ct).ConfigureAwait(false);
+                    if (!sResp.IsSuccessStatusCode) continue;
+
+                    var sJson = await sResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                    using var sDoc = JsonDocument.Parse(sJson);
+                    if (!sDoc.RootElement.TryGetProperty("values", out var vals) || vals.ValueKind != JsonValueKind.Array)
+                        continue;
+
+                    foreach (var s in vals.EnumerateArray())
+                    {
+                        var name = s.TryGetProperty("name", out var n) ? (n.GetString() ?? string.Empty) : string.Empty;
+                        if (name.Equals(sprintText, StringComparison.OrdinalIgnoreCase) &&
+                            (!Regex.IsMatch(projectKeyOrId, @"^[A-Z0-9_]+$") || name.IndexOf(projectKeyOrId, StringComparison.OrdinalIgnoreCase) >= 0))
+                            return s.TryGetProperty("id", out var sid) ? sid.GetInt32() : (long?)null;
+                    }
+
+                    if (wantNum.HasValue)
+                    {
+                        foreach (var s in vals.EnumerateArray())
+                        {
+                            var name = s.TryGetProperty("name", out var n) ? (n.GetString() ?? string.Empty) : string.Empty;
+                            var mn = Regex.Match(name, @"\d+");
+                            if (mn.Success && int.Parse(mn.Value) == wantNum.Value &&
+                                (!Regex.IsMatch(projectKeyOrId, @"^[A-Z0-9_]+$") || name.IndexOf(projectKeyOrId, StringComparison.OrdinalIgnoreCase) >= 0))
+                                return s.TryGetProperty("id", out var sid) ? sid.GetInt32() : (long?)null;
+                        }
+                    }
+                }
+            }
+            catch { /* best-effort */ }
+            return null;
+        }
+
+        // ========= INTERNALS =========
 
         private async Task<IReadOnlyList<JiraIssue>?> TrySearch(string url, CancellationToken ct)
         {
@@ -346,21 +502,28 @@ namespace SprintReportGenerator.Services
             return $" AND issuetype in ({string.Join(", ", arr)})";
         }
 
-        private async Task<IReadOnlyList<JiraIssue>> TryFirstNonEmptyAsync(IEnumerable<string> jqls, CancellationToken ct)
+        private async Task<IReadOnlyList<JiraIssue>> FetchIssuesByKeysAsync(IEnumerable<string> keys, CancellationToken ct)
         {
-            foreach (var jql in jqls)
+            var list = new List<JiraIssue>();
+            const int chunk = 50;
+
+            var arr = keys.Where(k => !string.IsNullOrWhiteSpace(k))
+                          .Distinct(StringComparer.OrdinalIgnoreCase)
+                          .ToArray();
+
+            for (int i = 0; i < arr.Length; i += chunk)
             {
-                var list = await SearchIssuesAsync(jql, ct).ConfigureAwait(false);
-                if (list != null && list.Count > 0)
-                    return list;
+                var slice = arr.Skip(i).Take(chunk).ToArray();
+                var jql = $"key in ({string.Join(", ", slice.Select(k => $"\"{k}\""))})";
+                var part = await SearchIssuesAsync(jql, ct).ConfigureAwait(false);
+                if (part.Count > 0) list.AddRange(part);
             }
-            return Array.Empty<JiraIssue>();
+            return list;
         }
 
         private static (DateTime? start, DateTime? end) ReadDatesFromJsonObject(JsonElement s)
         {
             DateTime? start = null, end = null;
-
             if (s.TryGetProperty("startDate", out var sd) && sd.ValueKind == JsonValueKind.String &&
                 DateTime.TryParse(sd.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var ds))
                 start = ds;
@@ -368,14 +531,6 @@ namespace SprintReportGenerator.Services
             if (s.TryGetProperty("endDate", out var ed) && ed.ValueKind == JsonValueKind.String &&
                 DateTime.TryParse(ed.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var de))
                 end = de;
-
-            if (!start.HasValue && s.TryGetProperty("activatedDate", out var ad) && ad.ValueKind == JsonValueKind.String &&
-                DateTime.TryParse(ad.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var da))
-                start = da;
-
-            if (!end.HasValue && s.TryGetProperty("completeDate", out var cd) && cd.ValueKind == JsonValueKind.String &&
-                DateTime.TryParse(cd.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var dc))
-                end = dc;
 
             return (start, end);
         }
@@ -404,7 +559,6 @@ namespace SprintReportGenerator.Services
                 var root = doc.RootElement;
 
                 DateTime? start = null, end = null;
-
                 if (root.TryGetProperty("startDate", out var sd) && sd.ValueKind == JsonValueKind.String &&
                     DateTime.TryParse(sd.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var ds))
                     start = ds;
@@ -413,35 +567,97 @@ namespace SprintReportGenerator.Services
                     DateTime.TryParse(ed.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var de))
                     end = de;
 
-                if (!start.HasValue && root.TryGetProperty("activatedDate", out var ad) && ad.ValueKind == JsonValueKind.String &&
-                    DateTime.TryParse(ad.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var da))
-                    start = da;
-
-                if (!end.HasValue && root.TryGetProperty("completeDate", out var cd) && cd.ValueKind == JsonValueKind.String &&
-                    DateTime.TryParse(cd.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var dc))
-                    end = dc;
-
                 return (start, end);
             }
             catch { return null; }
         }
 
-        private static bool TryGetTrailingNumber(string? name, out int n)
+        // ===== Helpers for sprintreport parsing & debug =====
+
+        private static void ExtractKeysFromSprintReport(JsonElement contents, HashSet<string> keys)
         {
-            n = 0;
-            if (string.IsNullOrWhiteSpace(name)) return false;
-            var m = Regex.Match(name, @"(\d+)\s*$");
-            return m.Success && int.TryParse(m.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out n);
+            // Known arrays with objects: completedIssues, issuesNotCompletedInCurrentSprint, puntedIssues, issuesCompletedInAnotherSprint
+            var objectArrays = new[] {
+                "completedIssues",
+                "issuesNotCompletedInCurrentSprint",
+                "puntedIssues",
+                "issuesCompletedInAnotherSprint",
+                "allIssues"
+            };
+            foreach (var prop in objectArrays)
+            {
+                if (!contents.TryGetProperty(prop, out var arr) || arr.ValueKind != JsonValueKind.Array) continue;
+                foreach (var el in arr.EnumerateArray())
+                {
+                    if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty("key", out var kEl))
+                    {
+                        var k = kEl.GetString();
+                        if (!string.IsNullOrWhiteSpace(k)) keys.Add(k!);
+                    }
+                }
+            }
+
+            // Strings: issueKeysAddedDuringSprint
+            if (contents.TryGetProperty("issueKeysAddedDuringSprint", out var strArr) && strArr.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var el in strArr.EnumerateArray())
+                {
+                    if (el.ValueKind == JsonValueKind.String)
+                    {
+                        var k = el.GetString();
+                        if (!string.IsNullOrWhiteSpace(k)) keys.Add(k!);
+                    }
+                }
+            }
+
+            // Be defensive: iterate any array & collect "key" or string entries
+            foreach (var prop in contents.EnumerateObject())
+            {
+                if (prop.Value.ValueKind != JsonValueKind.Array) continue;
+                foreach (var el in prop.Value.EnumerateArray())
+                {
+                    if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty("key", out var kEl))
+                    {
+                        var k = kEl.GetString();
+                        if (!string.IsNullOrWhiteSpace(k)) keys.Add(k!);
+                    }
+                    else if (el.ValueKind == JsonValueKind.String)
+                    {
+                        var k = el.GetString();
+                        if (!string.IsNullOrWhiteSpace(k)) keys.Add(k!);
+                    }
+                }
+            }
         }
 
-        private static int? TryParseAnyNumber(string? text)
+        private static void WriteStrictDebug(List<string> lines, HashSet<string>? keys)
         {
-            if (string.IsNullOrWhiteSpace(text)) return null;
-            var m = Regex.Match(text, @"\d+");
-            if (!m.Success) return null;
-            return int.TryParse(m.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var v) ? v : (int?)null;
+            try
+            {
+                if (keys != null)
+                {
+                    lines.Add($"officialKeys count={keys.Count}");
+                    lines.Add("officialKeys sample: " + string.Join(", ", keys.Take(20)));
+                }
+                var path = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "strict_debug.txt");
+                System.IO.File.AppendAllText(path, string.Join(Environment.NewLine, lines) + Environment.NewLine + new string('-', 80) + Environment.NewLine);
+            }
+            catch { /* ignore logging failures */ }
         }
-
-        public void Dispose() => _http.Dispose();
+        public void Dispose()
+        {
+            _http.Dispose();
+        }
     }
+
+    internal static class JsonElementExt
+    {
+        public static int GetInt32(this JsonElement el, string property)
+        {
+            return el.TryGetProperty(property, out var p) ? p.GetInt32() : 0;
+        }
+    }
+
 }
+
+

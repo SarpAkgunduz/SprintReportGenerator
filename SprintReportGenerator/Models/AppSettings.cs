@@ -10,6 +10,7 @@
         public string MemberName { get; set; } = string.Empty;  // e.g., Sarp Akgündüz
         public bool RememberMe { get; set; } = false;
         public bool OpenAfterGenerate { get; set; } = true;
-
+        public int? OverrideBoardId { get; set; }
+        public long? OverrideSprintId { get; set; }
     }
 }

@@ -1,4 +1,5 @@
-﻿using SprintReportGenerator.Models;
+﻿// Forms/MainForm.cs
+using SprintReportGenerator.Models;
 using SprintReportGenerator.Services;
 using SprintReportGenerator.Services.Interfaces;
 using System;
@@ -21,7 +22,7 @@ namespace SprintReportGenerator.Forms
         private readonly OpenXmlTemplateProcessor _report = new OpenXmlTemplateProcessor();
         private readonly ISettingsStore _store = new JsonSettingsStore();
 
-        private ListView lvIssues; // two-column list (Issue Type | Key)
+        private ListView lvIssues;
 
         private System.Windows.Forms.Timer _autoPreviewTimer;
         private CancellationTokenSource? _activeLoadCts;
@@ -74,7 +75,7 @@ namespace SprintReportGenerator.Forms
         }
 
         // =========================
-        // Generate report (Bug/Improvement/Story)
+        // Generate report
         // =========================
         private async void btnGenerate_Click(object? sender, EventArgs e)
         {
@@ -109,7 +110,7 @@ namespace SprintReportGenerator.Forms
                 IReadOnlyList<JiraIssue> issues = Array.Empty<JiraIssue>();
                 string sprintStartTr = string.Empty, sprintEndTr = string.Empty;
 
-                // Fetch issues and (best-effort) sprint dates
+                // Fetch issues and sprint date range (best effort)
                 if (!string.IsNullOrWhiteSpace(_settings.Email) &&
                     !string.IsNullOrWhiteSpace(_settings.JiraUrl) &&
                     !string.IsNullOrWhiteSpace(_settings.EncApiToken))
@@ -120,24 +121,20 @@ namespace SprintReportGenerator.Forms
                         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(25));
                         using var client = new JiraClient(_settings.JiraUrl.TrimEnd('/'), _settings.Email, token);
 
-                        // Get issues for this sprint (unfiltered first)
-                        var jql = JqlBuilder.SprintIssues(projectName, sprintName);
-                        var raw = await client.SearchIssuesAsync(jql, cts.Token).ConfigureAwait(true);
+                        // STRICT sprint fetch, only Bug/Improvement/Story
+                        var allowedTypes = new[] { "Bug", "Improvement", "Story" };
+                        var raw = await client
+                            .SearchIssuesByProjectAndSprintAsync(projectName, sprintName, allowedTypes, cts.Token)
+                            .ConfigureAwait(true);
 
-                        // Keep only Bug/Improvement/Story for the report
-                        var allowed = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                            { "Bug", "Improvement", "Story" };
-                        issues = raw.Where(i => allowed.Contains(i.Type)).ToArray();
+                        issues = raw;
 
-                        // Derive project KEY (e.g., AIRPMD) from any issue key if available
+                        // derive project KEY from first issue key if available, else use user input
                         string projectKeyOrId = projectName;
-                        var keyCandidate = raw.FirstOrDefault()?.Key
-                                           ?? issues.FirstOrDefault()?.Key
-                                           ?? string.Empty;
+                        var keyCandidate = raw.FirstOrDefault()?.Key ?? string.Empty;
                         var dash = keyCandidate.IndexOf('-');
                         if (dash > 0) projectKeyOrId = keyCandidate.Substring(0, dash);
 
-                        // Try to resolve sprint date range
                         try
                         {
                             var (start, end) = await client
@@ -148,13 +145,13 @@ namespace SprintReportGenerator.Forms
                             if (start.HasValue) sprintStartTr = start.Value.ToString("d MMMM yyyy", tr);
                             if (end.HasValue) sprintEndTr = end.Value.ToString("d MMMM yyyy", tr);
                         }
-                        catch { /* best-effort */ }
+                        catch { /* ignore */ }
                     }
                 }
 
                 var data = new TemplateData
                 {
-                    ReportDate = DateTime.Today.ToString("dd.MM.yyyy", new CultureInfo("en-US")),
+                    ReportDate = DateTime.Today.ToString("dd.MM.yyyy", CultureInfo.InvariantCulture),
                     ProjectName = _settings.ProjectName ?? string.Empty,
                     MemberName = _settings.MemberName ?? string.Empty,
                     SprintName = _settings.SprintName ?? string.Empty,
@@ -189,7 +186,7 @@ namespace SprintReportGenerator.Forms
         }
 
         // =========================
-        // Auto-preview (project required; sprint optional)
+        // Auto-preview
         // =========================
 
         private string ProjectNameText => txtProjectName?.Text?.Trim() ?? string.Empty;
@@ -215,7 +212,6 @@ namespace SprintReportGenerator.Forms
 
         private void FillIssues(IEnumerable<JiraIssue>? issues)
         {
-            // Show: Issue Type | Key
             lvIssues.BeginUpdate();
             lvIssues.Items.Clear();
 
