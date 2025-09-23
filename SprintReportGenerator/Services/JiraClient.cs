@@ -96,7 +96,24 @@ namespace SprintReportGenerator.Services
             if (take > 0 && list.Count > take) return list.Take(take).ToArray();
             return list;
         }
-
+        /// <summary>
+        /// Returns (statusCode, body). Tries Basic first, then Bearer.
+        /// </summary>
+        /// <param name="url"></param>
+        /// <param name="ct"></param>
+        /// <returns></returns>
+        private async Task<(HttpStatusCode code, string body)> GetWithAuthFallbackAsync(string url, CancellationToken ct)
+        {
+            foreach (var auth in new[] { _authBasic, _authBearer })
+            {
+                _http.DefaultRequestHeaders.Authorization = auth;
+                using var resp = await _http.GetAsync(url, ct).ConfigureAwait(false);
+                var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                if (resp.IsSuccessStatusCode) return (resp.StatusCode, body);
+            }
+            // Sonuncunun sonucunu döndür
+            return (HttpStatusCode.Unauthorized, string.Empty);
+        }
         /// <summary>
         /// STRICT sprint search:
         /// 1) Collect ALL candidate (boardId,sprintId) pairs matching the sprint (exact name first, then numeric).
@@ -131,12 +148,12 @@ namespace SprintReportGenerator.Services
                 if (!string.IsNullOrWhiteSpace(project) && !string.IsNullOrWhiteSpace(sprintText))
                 {
                     var boardsUrl = $"{_baseUrl}/rest/agile/1.0/board?projectKeyOrId={Uri.EscapeDataString(project)}&maxResults=50";
-                    using var bResp = await _http.GetAsync(boardsUrl, ct).ConfigureAwait(false);
-                    dbg.Add($"boards GET {bResp.StatusCode}");
+                    var (bCode, boardsJson) = await GetWithAuthFallbackAsync(boardsUrl, ct);
+                    dbg.Add($"boards GET {bCode}");
 
-                    if (bResp.IsSuccessStatusCode)
+                    if (bCode == HttpStatusCode.OK)
                     {
-                        using var bDoc = JsonDocument.Parse(await bResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+                        using var bDoc = JsonDocument.Parse(boardsJson);
                         if (bDoc.RootElement.TryGetProperty("values", out var boards) && boards.ValueKind == JsonValueKind.Array)
                         {
                             foreach (var b in boards.EnumerateArray())
@@ -145,11 +162,11 @@ namespace SprintReportGenerator.Services
                                 var bid = idEl.GetInt32();
 
                                 var sUrl = $"{_baseUrl}/rest/agile/1.0/board/{bid}/sprint?state=active,closed,future&maxResults=500";
-                                using var sResp = await _http.GetAsync(sUrl, ct).ConfigureAwait(false);
-                                dbg.Add($"sprints(board={bid}) GET {sResp.StatusCode}");
-                                if (!sResp.IsSuccessStatusCode) continue;
+                                var (sCode, sJson) = await GetWithAuthFallbackAsync(sUrl, ct);
+                                dbg.Add($"sprints(board={bid}) GET {sCode}");
+                                if (sCode != HttpStatusCode.OK) continue;
 
-                                using var sDoc = JsonDocument.Parse(await sResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+                                using var sDoc = JsonDocument.Parse(sJson);
                                 if (!sDoc.RootElement.TryGetProperty("values", out var vals) || vals.ValueKind != JsonValueKind.Array)
                                     continue;
 
@@ -203,11 +220,11 @@ namespace SprintReportGenerator.Services
                 try
                 {
                     var url = $"{_baseUrl}/rest/greenhopper/1.0/rapid/charts/sprintreport?rapidViewId={boardId}&sprintId={sprintId}";
-                    using var r = await _http.GetAsync(url, ct).ConfigureAwait(false);
-                    dbg.Add($"sprintreport(board={boardId},sprint={sprintId}) -> {r.StatusCode}");
-                    if (!r.IsSuccessStatusCode) return keys;
+                    var (rCode, rText) = await GetWithAuthFallbackAsync(url, ct);
+                    dbg.Add($"sprintreport(board={boardId},sprint={sprintId}) -> {rCode}");
+                    if (rCode != HttpStatusCode.OK) return keys;
 
-                    using var doc = JsonDocument.Parse(await r.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+                    using var doc = JsonDocument.Parse(rText);
                     if (!doc.RootElement.TryGetProperty("contents", out var contents)) return keys;
 
                     ExtractKeysFromSprintReport(contents, keys);
@@ -231,6 +248,7 @@ namespace SprintReportGenerator.Services
                 {
                     chosenBoard = cand.boardId;
                     chosenSprint = cand.sprintId;
+                    dbg.Add($"CHOSEN_BY_KEYS board={chosenBoard} sprint={chosenSprint} name='{cand.name}' start={cand.start:o} end={cand.end:o}");
                     officialKeys = k;
                     dbg.Add($"CHOSEN by keys: board={chosenBoard}, sprint={chosenSprint}, keys={officialKeys.Count}");
                     break;
@@ -287,18 +305,24 @@ namespace SprintReportGenerator.Services
 
             // 4) No key set -> fall back to sprint=id JQL (still project-scoped)
             var results = new List<JiraIssue>();
+
             if (chosenSprint.HasValue)
             {
                 var jql = $"{projectClause} AND sprint = {chosenSprint.Value}{typeClause} ORDER BY updated DESC";
                 dbg.Add("FALLBACK JQL: " + jql);
-
+                results = (await SearchIssuesAsync(jql, ct).ConfigureAwait(false)).ToList();
+            }
+            else if (int.TryParse(sprintText, out var sidNumeric))
+            {
+                // sprintText sayısal ise ismi değil ID kabul et
+                var jql = $"{projectClause} AND sprint = {sidNumeric}{typeClause} ORDER BY updated DESC";
+                dbg.Add("FALLBACK JQL (by numeric): " + jql);
                 results = (await SearchIssuesAsync(jql, ct).ConfigureAwait(false)).ToList();
             }
             else if (!string.IsNullOrWhiteSpace(sprintText))
             {
                 var jql = $"{projectClause} AND sprint = \"{Esc(sprintText)}\"{typeClause} ORDER BY updated DESC";
                 dbg.Add("FALLBACK JQL (by name): " + jql);
-
                 results = (await SearchIssuesAsync(jql, ct).ConfigureAwait(false)).ToList();
             }
 
@@ -322,11 +346,9 @@ namespace SprintReportGenerator.Services
                     return (null, null);
 
                 var boardsUrl = $"{_baseUrl}/rest/agile/1.0/board?projectKeyOrId={Uri.EscapeDataString(projectKeyOrId)}&maxResults=50";
-                using var boardsResp = await _http.GetAsync(boardsUrl, ct).ConfigureAwait(false);
-                if (!boardsResp.IsSuccessStatusCode) return await TryByIdFallback(projectKeyOrId, sprintText, ct).ConfigureAwait(false);
-
-                var boardsJson = await boardsResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-                using var boardsDoc = JsonDocument.Parse(boardsJson);
+                var (bCode2, boardsJson2) = await GetWithAuthFallbackAsync(boardsUrl, ct);
+                if (bCode2 != HttpStatusCode.OK) return await TryByIdFallback(projectKeyOrId, sprintText, ct).ConfigureAwait(false);
+                using var boardsDoc = JsonDocument.Parse(boardsJson2);
                 if (!boardsDoc.RootElement.TryGetProperty("values", out var boardsEl) || boardsEl.ValueKind != JsonValueKind.Array)
                     return await TryByIdFallback(projectKeyOrId, sprintText, ct).ConfigureAwait(false);
 
@@ -336,11 +358,9 @@ namespace SprintReportGenerator.Services
                     var boardId = idEl.GetInt32();
 
                     var sUrl = $"{_baseUrl}/rest/agile/1.0/board/{boardId}/sprint?state=active,closed,future&maxResults=200";
-                    using var sResp = await _http.GetAsync(sUrl, ct).ConfigureAwait(false);
-                    if (!sResp.IsSuccessStatusCode) continue;
-
-                    var sJson = await sResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-                    using var sDoc = JsonDocument.Parse(sJson);
+                    var (sCode2, sJson2) = await GetWithAuthFallbackAsync(sUrl, ct);
+                    if (sCode2 != HttpStatusCode.OK) continue;
+                    using var sDoc = JsonDocument.Parse(sJson2);
                     if (!sDoc.RootElement.TryGetProperty("values", out var vals) || vals.ValueKind != JsonValueKind.Array)
                         continue;
 
@@ -390,11 +410,9 @@ namespace SprintReportGenerator.Services
                 if (m.Success) wantNum = int.Parse(m.Value);
 
                 var boardsUrl = $"{_baseUrl}/rest/agile/1.0/board?projectKeyOrId={Uri.EscapeDataString(projectKeyOrId)}&maxResults=50";
-                using var boardsResp = await _http.GetAsync(boardsUrl, ct).ConfigureAwait(false);
-                if (!boardsResp.IsSuccessStatusCode) return null;
-
-                var boardsJson = await boardsResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-                using var boardsDoc = JsonDocument.Parse(boardsJson);
+                var (bCode3, boardsJson3) = await GetWithAuthFallbackAsync(boardsUrl, ct);
+                if (bCode3 != HttpStatusCode.OK) return null;
+                using var boardsDoc = JsonDocument.Parse(boardsJson3);
                 if (!boardsDoc.RootElement.TryGetProperty("values", out var boardsEl) || boardsEl.ValueKind != JsonValueKind.Array)
                     return null;
 
@@ -404,11 +422,10 @@ namespace SprintReportGenerator.Services
                     var boardId = idEl.GetInt32();
 
                     var sUrl = $"{_baseUrl}/rest/agile/1.0/board/{boardId}/sprint?state=active,closed,future&maxResults=200";
-                    using var sResp = await _http.GetAsync(sUrl, ct).ConfigureAwait(false);
-                    if (!sResp.IsSuccessStatusCode) continue;
+                    var (sCode3, sJson3) = await GetWithAuthFallbackAsync(sUrl, ct);
+                    if (sCode3 != HttpStatusCode.OK) continue;
+                    using var sDoc = JsonDocument.Parse(sJson3);
 
-                    var sJson = await sResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-                    using var sDoc = JsonDocument.Parse(sJson);
                     if (!sDoc.RootElement.TryGetProperty("values", out var vals) || vals.ValueKind != JsonValueKind.Array)
                         continue;
 
@@ -551,10 +568,9 @@ namespace SprintReportGenerator.Services
             try
             {
                 var url = $"{_baseUrl}/rest/agile/1.0/sprint/{sprintId}";
-                using var resp = await _http.GetAsync(url, ct).ConfigureAwait(false);
-                if (!resp.IsSuccessStatusCode) return null;
+                var (code, json) = await GetWithAuthFallbackAsync(url, ct);
+                if (code != HttpStatusCode.OK) return null;
 
-                var json = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
                 using var doc = JsonDocument.Parse(json);
                 var root = doc.RootElement;
 

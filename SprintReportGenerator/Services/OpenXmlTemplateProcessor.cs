@@ -43,21 +43,28 @@ namespace SprintReportGenerator.Services
 
                 var body = doc.MainDocumentPart!.Document.Body ?? (doc.MainDocumentPart.Document.Body = new Body());
 
-                // tokens
+                // Replace placeholders
                 ReplaceToken(body, "{{PROJECT}}", data.ProjectName ?? "");
                 ReplaceToken(body, "{{FORM_DATE}}", data.ReportDate ?? "");
                 ReplaceToken(body, "{{MEMBER_NAME}}", data.MemberName ?? "");
                 ReplaceToken(body, "{{SPRINT}}", data.SprintName ?? "");
 
-                // summary
+                // >>> Keep TOC alone on first page: start content on a NEW page
+                AppendPageBreak(body);
+
+                // SUMMARY
                 AppendSummaryTrSection(body, data, filtered);
 
-                // tables
+                // TABLES
                 AppendSection(doc, body, "Test Senaryo durumları", filtered, headingLevel: 2);
+
                 AppendSection(doc, body, "Sprint Kapsamında Açılan Buglar",
-                    filtered.Where(i => i.Type.Equals("Bug", StringComparison.OrdinalIgnoreCase)), 2);
+                    filtered.Where(i => i.Type.Equals("Bug", StringComparison.OrdinalIgnoreCase)),
+                    headingLevel: 2);
+
                 AppendSection(doc, body, "Sprint Kapsamında Açılan Improvement Kayıtları",
-                    filtered.Where(i => i.Type.Equals("Improvement", StringComparison.OrdinalIgnoreCase)), 2);
+                    filtered.Where(i => i.Type.Equals("Improvement", StringComparison.OrdinalIgnoreCase)),
+                    headingLevel: 2);
 
                 doc.MainDocumentPart.Document.Save();
             }
@@ -65,7 +72,16 @@ namespace SprintReportGenerator.Services
             return output;
         }
 
-        // robust token replace across split runs
+        private static Paragraph BlankLine() => new Paragraph(new Run(new Text("")));
+
+        private static void AppendPageBreak(Body body)
+        {
+            // insert a page break so TOC stays on its own page
+            var p = new Paragraph(new Run(new Break { Type = BreakValues.Page }));
+            body.AppendChild(p);
+        }
+
+        // Robust token replacement across split runs
         private static void ReplaceToken(Body body, string token, string value)
         {
             if (body == null || string.IsNullOrEmpty(token)) return;
@@ -93,15 +109,19 @@ namespace SprintReportGenerator.Services
             }
         }
 
+        /// <summary>
+        /// Section with heading + table + spacing (adds 1 blank line after heading and after table)
+        /// </summary>
         private static void AppendSection(WordprocessingDocument doc, Body body, string heading, IEnumerable<JiraIssue> source, int headingLevel = 2)
         {
             body.AppendChild(MakeHeadingParagraph(heading, headingLevel));
+            body.AppendChild(BlankLine()); // spacing after heading
 
             var list = source?.ToList() ?? new List<JiraIssue>();
             var table = BuildIssuesTable(list);
             body.AppendChild(table);
 
-            body.AppendChild(new Paragraph(new Run(new Text(" "))));
+            body.AppendChild(BlankLine()); // spacing after section content
         }
 
         private static Paragraph MakeHeadingParagraph(string text, int level = 2)
@@ -119,6 +139,7 @@ namespace SprintReportGenerator.Services
                 ParagraphStyleId = new ParagraphStyleId { Val = $"Heading{level}" },
                 OutlineLevel = new OutlineLevel { Val = (byte)(level - 1) }
             };
+
             p.ParagraphProperties = props;
             return p;
         }
@@ -146,7 +167,7 @@ namespace SprintReportGenerator.Services
             }));
 
             p.ParagraphProperties = new ParagraphProperties(
-                new Indentation { Left = "720", Hanging = "360" } // ~0.5"
+                new Indentation { Left = "720", Hanging = "360" } // ~0.5" indent
             );
 
             return p;
@@ -156,6 +177,7 @@ namespace SprintReportGenerator.Services
         private static void AppendSummaryTrSection(Body body, Models.TemplateData data, List<JiraIssue> items)
         {
             body.AppendChild(MakeHeadingParagraph("Özet", 2));
+            body.AppendChild(BlankLine()); // spacing after "Özet" heading
 
             static string BuildDateLead(string start, string end)
             {
@@ -183,7 +205,9 @@ namespace SprintReportGenerator.Services
             var p1 = $"{prefix}{proj} projesi {sprint} sprintine ait {total} kayıt bulunmaktadır. Bunlardan {closed}’i Closed durumundadır.";
             body.AppendChild(new Paragraph(new Run(new Text(p1) { Space = SpaceProcessingModeValues.Preserve })));
 
+            // Next heading + blank
             body.AppendChild(MakeHeadingParagraph("Test genel, hata bildirimi ve iyileştirme durumu", 2));
+            body.AppendChild(BlankLine());
 
             static string BreakdownTr(int cl, int cn, int ip, int iq, int bl, int op, int de)
             {
@@ -229,7 +253,7 @@ namespace SprintReportGenerator.Services
                 items.Where(i => i.Type?.Equals("Story", StringComparison.OrdinalIgnoreCase) == true),
                 "Testler sırasında");
 
-            body.AppendChild(new Paragraph(new Run(new Text(" "))));
+            body.AppendChild(BlankLine()); // spacing after summary block
         }
 
         // ===== Table builders =====
@@ -250,6 +274,7 @@ namespace SprintReportGenerator.Services
             );
             table.AppendChild(props);
 
+            // Header
             var header = new TableRow();
             header.Append(
                 MakeHeaderCell("Project"),
@@ -337,29 +362,34 @@ namespace SprintReportGenerator.Services
             return cell;
         }
 
-        // colors & status helpers
+        // ===== Status helpers & colors =====
         private const string ColorGreenClosed = "92D050"; // Closed
-        private const string ColorBlueCancel = "1E90FF";  // Cancelled/FPA
-        private const string ColorYellowOpen = "FFFF00";  // Others
+        private const string ColorBlueCancel = "1E90FF"; // Cancelled/FPA
+        private const string ColorYellowOpen = "FFFF00"; // Others
         private const string ColorGrayBlocked = "C9C9C9"; // Blocked cells
-        private const string ColorGrayHeader = "A6A6A6";  // Header shade
+        private const string ColorGrayHeader = "A6A6A6"; // Header shade
 
         private static bool IsOpenStatus(string? s) => !string.IsNullOrWhiteSpace(s) &&
             (s!.Trim().Equals("Open", StringComparison.OrdinalIgnoreCase));
         private static bool IsClosedStatus(string? s) => !string.IsNullOrWhiteSpace(s) &&
             (s!.Trim().Equals("Closed", StringComparison.OrdinalIgnoreCase) ||
              s.Trim().Equals("Done", StringComparison.OrdinalIgnoreCase));
+
         private static bool IsCancelledStatus(string? s) => !string.IsNullOrWhiteSpace(s) &&
             (s!.Trim().Equals("Cancelled", StringComparison.OrdinalIgnoreCase) ||
              s.Trim().Equals("Canceled", StringComparison.OrdinalIgnoreCase) ||
              s.Trim().Equals("False Positive Approval", StringComparison.OrdinalIgnoreCase));
+
         private static bool IsInProgressStatus(string? s) => !string.IsNullOrWhiteSpace(s) &&
             (s!.Trim().Equals("In Progress", StringComparison.OrdinalIgnoreCase));
+
         private static bool IsDevCompletedStatus(string? s) => !string.IsNullOrWhiteSpace(s) &&
             (s!.Trim().Equals("Dev Completed", StringComparison.OrdinalIgnoreCase));
+
         private static bool IsInQaStatus(string? s) => !string.IsNullOrWhiteSpace(s) &&
             (s!.Trim().Equals("In Q&A", StringComparison.OrdinalIgnoreCase) ||
              s.Trim().Equals("In QA", StringComparison.OrdinalIgnoreCase));
+
         private static bool IsBlockedStatus(string? s) =>
             !string.IsNullOrWhiteSpace(s) && s!.Trim().Equals("Blocked", StringComparison.OrdinalIgnoreCase);
 
