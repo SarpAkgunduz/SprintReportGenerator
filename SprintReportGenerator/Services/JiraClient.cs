@@ -161,44 +161,72 @@ namespace SprintReportGenerator.Services
                                 if (!b.TryGetProperty("id", out var idEl)) continue;
                                 var bid = idEl.GetInt32();
 
-                                var sUrl = $"{_baseUrl}/rest/agile/1.0/board/{bid}/sprint?state=active,closed,future&maxResults=500";
-                                var (sCode, sJson) = await GetWithAuthFallbackAsync(sUrl, ct);
-                                dbg.Add($"sprints(board={bid}) GET {sCode}");
-                                if (sCode != HttpStatusCode.OK) continue;
+                                // --- PAGINATION: search all the jira pages ---
+                                var exact = new List<(int boardId, long sprintId, string name, DateTime? start, DateTime? end)>();
+                                var numeric = new List<(int boardId, long sprintId, string name, DateTime? start, DateTime? end)>();
 
-                                using var sDoc = JsonDocument.Parse(sJson);
-                                if (!sDoc.RootElement.TryGetProperty("values", out var vals) || vals.ValueKind != JsonValueKind.Array)
-                                    continue;
+                                int startAt = 0;
+                                const int pageSize = 50; // Jira Agile default page size
 
-                                // collect exact-name matches first
-                                foreach (var s in vals.EnumerateArray())
+                                while (true)
                                 {
-                                    var name = s.TryGetProperty("name", out var n) ? (n.GetString() ?? "") : "";
-                                    if (name.Equals(sprintText, StringComparison.OrdinalIgnoreCase) &&
-                                        (!projectLooksLikeKey || name.IndexOf(project, StringComparison.OrdinalIgnoreCase) >= 0))
-                                    {
-                                        var sid = s.GetProperty("id").GetInt32();
-                                        var (st, en) = ReadDatesFromJsonObject(s);
-                                        candidates.Add((bid, sid, name, st, en));
-                                    }
-                                }
+                                    var sUrl =
+                                        $"{_baseUrl}/rest/agile/1.0/board/{bid}/sprint" +
+                                        $"?state=active,closed,future&maxResults={pageSize}&startAt={startAt}";
 
-                                // then numeric-equality matches (if none collected yet)
-                                if (candidates.Count == 0 && wantNum.HasValue)
-                                {
-                                    foreach (var s in vals.EnumerateArray())
+                                    using var sResp = await _http.GetAsync(sUrl, ct).ConfigureAwait(false);
+                                    dbg.Add($"sprints(board={bid}) GET {sResp.StatusCode} startAt={startAt}");
+                                    if (!sResp.IsSuccessStatusCode) break;
+
+                                    var sJson = await sResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                                    using var sDocPage = JsonDocument.Parse(sJson);
+                                    var rootPage = sDocPage.RootElement;
+
+                                    if (!rootPage.TryGetProperty("values", out var valsPage) || valsPage.ValueKind != JsonValueKind.Array)
+                                        break;
+
+                                    int pageCount = 0;
+
+                                    foreach (var s in valsPage.EnumerateArray())
                                     {
+                                        pageCount++;
+
                                         var name = s.TryGetProperty("name", out var n) ? (n.GetString() ?? "") : "";
-                                        var mn = Regex.Match(name, @"\d+");
-                                        if (mn.Success && int.Parse(mn.Value) == wantNum.Value &&
-                                            (!projectLooksLikeKey || name.IndexOf(project, StringComparison.OrdinalIgnoreCase) >= 0))
+                                        var sid = s.TryGetProperty("id", out var sidEl) ? (long)sidEl.GetInt32() : 0;
+                                        var (st, en) = ReadDatesFromJsonObject(s);
+
+                                        // sprint adı projeyi içeriyorsa (AIRPMD Sprint 73 gibi) proje filtrelemesi
+                                        bool projOk = (!projectLooksLikeKey || name.IndexOf(project, StringComparison.OrdinalIgnoreCase) >= 0);
+
+                                        // 1) tam ad eşleşmesi
+                                        if (projOk && name.Equals(sprintText, StringComparison.OrdinalIgnoreCase))
                                         {
-                                            var sid = s.GetInt32("id");
-                                            var (st, en) = ReadDatesFromJsonObject(s);
-                                            candidates.Add((bid, sid, name, st, en));
+                                            exact.Add((bid, sid, name, st, en));
+                                            continue;
+                                        }
+
+                                        // 2) sayı eşleşmesi
+                                        if (projOk && wantNum.HasValue)
+                                        {
+                                            var mn = Regex.Match(name, @"\d+");
+                                            if (mn.Success && int.Parse(mn.Value) == wantNum.Value)
+                                                numeric.Add((bid, sid, name, st, en));
                                         }
                                     }
+
+                                    dbg.Add($"  -> pageCount={pageCount}");
+
+                                    bool isLast = rootPage.TryGetProperty("isLast", out var il) && il.GetBoolean();
+                                    if (isLast || pageCount == 0) break;
+
+                                    startAt += pageCount; // bir sonraki sayfaya
                                 }
+
+                                // Önce tam-isim eşleşmelerini tercih et; yoksa sayısal eşleşmeleri kullan
+                                if (exact.Count > 0) candidates.AddRange(exact);
+                                else if (numeric.Count > 0) candidates.AddRange(numeric);
+
+
                             }
                         }
                     }
@@ -279,28 +307,55 @@ namespace SprintReportGenerator.Services
             }
 
             // 3) If we have official keys -> query strictly by keys
+            // 3) If we have official keys -> query strictly by keys AND sprint
             if (officialKeys.Count > 0)
             {
-                dbg.Add("STRICT by official key set");
-                var list = await FetchIssuesByKeysAsync(officialKeys, ct).ConfigureAwait(false);
+                dbg.Add("STRICT by official key set (enforce sprint in JQL)");
 
-                // also enforce project/type on client-side
-                var filtered = list.Where(i =>
+                var filtered = new List<JiraIssue>();
+                var keys = officialKeys.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+
+                if (!chosenSprint.HasValue)
+                {
+                    // normalde olmamalı; yine de fallback
+                    dbg.Add("WARN: chosenSprint missing while we have keys; falling back to key-in only.");
+                    filtered = (await FetchIssuesByKeysAsync(keys, ct)).ToList();
+                }
+                else
+                {
+                    const int chunk = 50;
+                    for (int i = 0; i < keys.Length; i += chunk)
+                    {
+                        var slice = keys.Skip(i).Take(chunk).Select(k => $"\"{k}\"");
+                        var jql =
+                            $"{projectClause} AND sprint = {chosenSprint.Value} " +
+                            $"AND key in ({string.Join(", ", slice)}){typeClause} ORDER BY updated DESC";
+
+                        dbg.Add("STRICT JQL: " + jql);
+
+                        var part = await SearchIssuesAsync(jql, ct).ConfigureAwait(false);
+                        if (part.Count > 0) filtered.AddRange(part);
+                    }
+                }
+
+                // güvenlik için proje filtrelemesi
+                IEnumerable<JiraIssue> result = filtered.Where(i =>
                     (projectLooksLikeKey
                         ? (i.Key?.StartsWith(project + "-", StringComparison.OrdinalIgnoreCase) ?? false)
-                        : string.Equals(i.Project, project, StringComparison.OrdinalIgnoreCase)))
-                    .ToList();
+                        : string.Equals(i.Project, project, StringComparison.OrdinalIgnoreCase)));
 
+                // isteğe bağlı tipi uygula
                 if (issueTypes != null)
                 {
                     var typeSet = new HashSet<string>(issueTypes.Where(t => !string.IsNullOrWhiteSpace(t)),
                                                       StringComparer.OrdinalIgnoreCase);
-                    filtered = filtered.Where(i => typeSet.Contains(i.Type ?? string.Empty)).ToList();
+                    result = result.Where(i => typeSet.Contains(i.Type ?? string.Empty));
                 }
 
-                dbg.Add($"RETURN keys={officialKeys.Count}, after filters={filtered.Count}");
+                var ret = result.ToList();
+                dbg.Add($"RETURN keys={officialKeys.Count}, after filters={ret.Count}");
                 WriteStrictDebug(dbg, officialKeys);
-                return filtered;
+                return ret;
             }
 
             // 4) No key set -> fall back to sprint=id JQL (still project-scoped)
@@ -592,54 +647,19 @@ namespace SprintReportGenerator.Services
 
         private static void ExtractKeysFromSprintReport(JsonElement contents, HashSet<string> keys)
         {
-            // Known arrays with objects: completedIssues, issuesNotCompletedInCurrentSprint, puntedIssues, issuesCompletedInAnotherSprint
-            var objectArrays = new[] {
+            var strictArrays = new[] {
                 "completedIssues",
-                "issuesNotCompletedInCurrentSprint",
-                "puntedIssues",
-                "issuesCompletedInAnotherSprint",
-                "allIssues"
+                "issuesNotCompletedInCurrentSprint"
             };
-            foreach (var prop in objectArrays)
+
+            foreach (var propName in strictArrays)
             {
-                if (!contents.TryGetProperty(prop, out var arr) || arr.ValueKind != JsonValueKind.Array) continue;
+                if (!contents.TryGetProperty(propName, out var arr) || arr.ValueKind != JsonValueKind.Array) continue;
                 foreach (var el in arr.EnumerateArray())
                 {
                     if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty("key", out var kEl))
                     {
                         var k = kEl.GetString();
-                        if (!string.IsNullOrWhiteSpace(k)) keys.Add(k!);
-                    }
-                }
-            }
-
-            // Strings: issueKeysAddedDuringSprint
-            if (contents.TryGetProperty("issueKeysAddedDuringSprint", out var strArr) && strArr.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var el in strArr.EnumerateArray())
-                {
-                    if (el.ValueKind == JsonValueKind.String)
-                    {
-                        var k = el.GetString();
-                        if (!string.IsNullOrWhiteSpace(k)) keys.Add(k!);
-                    }
-                }
-            }
-
-            // Be defensive: iterate any array & collect "key" or string entries
-            foreach (var prop in contents.EnumerateObject())
-            {
-                if (prop.Value.ValueKind != JsonValueKind.Array) continue;
-                foreach (var el in prop.Value.EnumerateArray())
-                {
-                    if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty("key", out var kEl))
-                    {
-                        var k = kEl.GetString();
-                        if (!string.IsNullOrWhiteSpace(k)) keys.Add(k!);
-                    }
-                    else if (el.ValueKind == JsonValueKind.String)
-                    {
-                        var k = el.GetString();
                         if (!string.IsNullOrWhiteSpace(k)) keys.Add(k!);
                     }
                 }

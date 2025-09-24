@@ -80,7 +80,10 @@ namespace SprintReportGenerator.Services
             var p = new Paragraph(new Run(new Break { Type = BreakValues.Page }));
             body.AppendChild(p);
         }
-
+        private static void AppendLineBreak()
+        {
+            
+        }
         // Robust token replacement across split runs
         private static void ReplaceToken(Body body, string token, string value)
         {
@@ -137,7 +140,9 @@ namespace SprintReportGenerator.Services
             var props = new ParagraphProperties
             {
                 ParagraphStyleId = new ParagraphStyleId { Val = $"Heading{level}" },
-                OutlineLevel = new OutlineLevel { Val = (byte)(level - 1) }
+                OutlineLevel = new OutlineLevel { Val = (byte)(level - 1) },
+
+                SpacingBetweenLines = new SpacingBetweenLines { After = "240" } //empty space after headers
             };
 
             p.ParagraphProperties = props;
@@ -167,7 +172,8 @@ namespace SprintReportGenerator.Services
             }));
 
             p.ParagraphProperties = new ParagraphProperties(
-                new Indentation { Left = "720", Hanging = "360" } // ~0.5" indent
+                new Indentation { Left = "720", Hanging = "360" }, // ~0.5" indent
+                new SpacingBetweenLines { Before = "120", After = "120" }
             );
 
             return p;
@@ -203,7 +209,17 @@ namespace SprintReportGenerator.Services
                 : $"{dateLead} {envPrefix} ortamında koşulan ";
 
             var p1 = $"{prefix}{proj} projesi {sprint} sprintine ait {total} kayıt bulunmaktadır. Bunlardan {closed}’i Closed durumundadır.";
-            body.AppendChild(new Paragraph(new Run(new Text(p1) { Space = SpaceProcessingModeValues.Preserve })));
+            var pLead = new Paragraph(new Run(new Text(p1)
+            {
+                Space = SpaceProcessingModeValues.Preserve
+            }));
+            pLead.ParagraphProperties ??= new ParagraphProperties();
+            pLead.ParagraphProperties.SpacingBetweenLines = new SpacingBetweenLines
+            {
+                After = "240"   // 240 twips ≈ 12pt ≈ ~1 line
+            };
+            body.AppendChild(pLead);
+
 
             // Next heading + blank
             body.AppendChild(MakeHeadingParagraph("Test genel, hata bildirimi ve iyileştirme durumu", 2));
