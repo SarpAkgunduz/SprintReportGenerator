@@ -66,6 +66,10 @@ namespace SprintReportGenerator.Services
                     filtered.Where(i => i.Type.Equals("Improvement", StringComparison.OrdinalIgnoreCase)),
                     headingLevel: 2);
 
+                AppendSection(doc, body, "Sprint Kapsamında Testi Tamamlanamayan Kayıtlar",
+                    filtered.Where(i => IsInQaStatus(i.Status)),
+                    headingLevel: 2);
+
                 doc.MainDocumentPart.Document.Save();
             }
 

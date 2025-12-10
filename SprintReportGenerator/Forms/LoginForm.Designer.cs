@@ -28,27 +28,28 @@
         /// </summary>
         private void InitializeComponent()
         {
-            txtEmail = new TextBox();
+            txtUserName = new TextBox();
             btnContinue = new Button();
             EmailLabel = new Label();
             chkRememberMe = new CheckBox();
-            txtApiToken = new TextBox();
+            txtSecret = new TextBox();
             ApiToken = new Label();
             txtJiraUrl = new TextBox();
             JiraUrlLabel = new Label();
+            chkIsBasic = new CheckBox();
             SuspendLayout();
             // 
-            // txtEmail
+            // txtUserName
             // 
-            txtEmail.AccessibleName = "";
-            txtEmail.Location = new Point(256, 130);
-            txtEmail.Name = "txtEmail";
-            txtEmail.Size = new Size(250, 27);
-            txtEmail.TabIndex = 0;
+            txtUserName.AccessibleName = "";
+            txtUserName.Location = new Point(256, 130);
+            txtUserName.Name = "txtUserName";
+            txtUserName.Size = new Size(250, 27);
+            txtUserName.TabIndex = 0;
             // 
             // btnContinue
             // 
-            btnContinue.Location = new Point(256, 324);
+            btnContinue.Location = new Point(348, 368);
             btnContinue.Name = "btnContinue";
             btnContinue.Size = new Size(88, 32);
             btnContinue.TabIndex = 1;
@@ -62,9 +63,9 @@
             EmailLabel.AutoSize = true;
             EmailLabel.Location = new Point(83, 133);
             EmailLabel.Name = "EmailLabel";
-            EmailLabel.Size = new Size(145, 20);
+            EmailLabel.Size = new Size(82, 20);
             EmailLabel.TabIndex = 2;
-            EmailLabel.Text = "Enter your jira email:";
+            EmailLabel.Text = "User name:";
             // 
             // chkRememberMe
             // 
@@ -76,22 +77,22 @@
             chkRememberMe.Text = "Remember me";
             chkRememberMe.UseVisualStyleBackColor = true;
             // 
-            // txtApiToken
+            // txtSecret
             // 
-            txtApiToken.Location = new Point(256, 183);
-            txtApiToken.Name = "txtApiToken";
-            txtApiToken.Size = new Size(250, 27);
-            txtApiToken.TabIndex = 4;
-            txtApiToken.UseSystemPasswordChar = true;
+            txtSecret.Location = new Point(256, 183);
+            txtSecret.Name = "txtSecret";
+            txtSecret.Size = new Size(250, 27);
+            txtSecret.TabIndex = 4;
+            txtSecret.UseSystemPasswordChar = true;
             // 
             // ApiToken
             // 
             ApiToken.AutoSize = true;
             ApiToken.Location = new Point(83, 186);
             ApiToken.Name = "ApiToken";
-            ApiToken.Size = new Size(170, 20);
+            ApiToken.Size = new Size(139, 20);
             ApiToken.TabIndex = 5;
-            ApiToken.Text = "Enter your jira api token:";
+            ApiToken.Text = "API token/Password";
             // 
             // txtJiraUrl
             // 
@@ -105,23 +106,34 @@
             JiraUrlLabel.AutoSize = true;
             JiraUrlLabel.Location = new Point(83, 234);
             JiraUrlLabel.Name = "JiraUrlLabel";
-            JiraUrlLabel.Size = new Size(160, 20);
+            JiraUrlLabel.Size = new Size(61, 20);
             JiraUrlLabel.TabIndex = 7;
-            JiraUrlLabel.Text = "Enter your base jira url:";
+            JiraUrlLabel.Text = "Jira URL";
+            // 
+            // chkIsBasic
+            // 
+            chkIsBasic.AutoSize = true;
+            chkIsBasic.Location = new Point(256, 322);
+            chkIsBasic.Name = "chkIsBasic";
+            chkIsBasic.Size = new Size(159, 24);
+            chkIsBasic.TabIndex = 8;
+            chkIsBasic.Text = "Basic Authorization";
+            chkIsBasic.UseVisualStyleBackColor = true;
             // 
             // LoginForm
             // 
             AutoScaleDimensions = new SizeF(8F, 20F);
             AutoScaleMode = AutoScaleMode.Font;
             ClientSize = new Size(800, 450);
+            Controls.Add(chkIsBasic);
             Controls.Add(JiraUrlLabel);
             Controls.Add(txtJiraUrl);
             Controls.Add(ApiToken);
-            Controls.Add(txtApiToken);
+            Controls.Add(txtSecret);
             Controls.Add(chkRememberMe);
             Controls.Add(EmailLabel);
             Controls.Add(btnContinue);
-            Controls.Add(txtEmail);
+            Controls.Add(txtUserName);
             Name = "LoginForm";
             Text = "LoginForm";
             ResumeLayout(false);
@@ -130,13 +142,15 @@
 
         #endregion
 
-        private TextBox txtEmail;
+        private TextBox txtUserName;
         private Button btnContinue;
         private Label EmailLabel;
         private CheckBox chkRememberMe;
-        private TextBox txtApiToken;
+        private TextBox txtSecret;
         private Label ApiToken;
         private TextBox txtJiraUrl;
         private Label JiraUrlLabel;
+        private CheckBox chkIsBasic;
+
     }
 }

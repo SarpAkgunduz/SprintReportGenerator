@@ -1,5 +1,4 @@
-﻿// Services/JiraClient.cs
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -29,33 +28,109 @@ namespace SprintReportGenerator.Services
         private readonly AuthenticationHeaderValue _authBasic;
         private readonly AuthenticationHeaderValue _authBearer;
 
-        public JiraClient(string baseUrl, string email, string apiToken, TimeSpan? timeout = null)
+        public JiraClient(string baseUrl, string email, string secret, 
+    bool useBasicAuth = true, TimeSpan? timeout = null)
+{
+    if (string.IsNullOrWhiteSpace(baseUrl)) throw new ArgumentException("baseUrl is required", nameof(baseUrl));
+    if (string.IsNullOrWhiteSpace(email)) throw new ArgumentException("email is required", nameof(email));
+    if (string.IsNullOrWhiteSpace(secret)) throw new ArgumentException("apiToken is required", nameof(secret));
+
+    _baseUrl = baseUrl.Trim().TrimEnd('/');
+
+    var handler = new HttpClientHandler
+    {
+        UseProxy = WebRequest.DefaultWebProxy != null,
+        Proxy = WebRequest.DefaultWebProxy,
+        DefaultProxyCredentials = CredentialCache.DefaultCredentials
+    };
+
+    _http = new HttpClient(handler, disposeHandler: true)
+    {
+        Timeout = timeout ?? TimeSpan.FromSeconds(20)
+    };
+
+    var basic = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{email}:{secret}"));
+    _authBasic = new AuthenticationHeaderValue("Basic", basic);
+    _authBearer = new AuthenticationHeaderValue("Bearer", secret);
+
+    // Start with the preferred auth method
+    _http.DefaultRequestHeaders.Authorization = useBasicAuth ? _authBasic : _authBearer;
+    
+    _http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+    _http.DefaultRequestHeaders.UserAgent.ParseAdd("SprintReportGenerator/1.0");
+}
+        public async Task<(bool success, string? errorMessage)> ValidateAsync(CancellationToken ct = default)
+{
+    var urls = new[]
+    {
+        $"{_baseUrl}/rest/api/2/myself",
+        $"{_baseUrl}/rest/api/3/myself"
+    };
+
+    foreach (var url in urls)
+    {
+        try
         {
-            if (string.IsNullOrWhiteSpace(baseUrl)) throw new ArgumentException("baseUrl is required", nameof(baseUrl));
-            if (string.IsNullOrWhiteSpace(email)) throw new ArgumentException("email is required", nameof(email));
-            if (string.IsNullOrWhiteSpace(apiToken)) throw new ArgumentException("apiToken is required", nameof(apiToken));
+            using var response = await _http.GetAsync(url, ct).ConfigureAwait(false);
+            
+            if (response.IsSuccessStatusCode)
+                return (true, null);
 
-            _baseUrl = baseUrl.Trim().TrimEnd('/');
-
-            var handler = new HttpClientHandler
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            
+            return response.StatusCode switch
             {
-                UseProxy = WebRequest.DefaultWebProxy != null,
-                Proxy = WebRequest.DefaultWebProxy,
-                DefaultProxyCredentials = CredentialCache.DefaultCredentials
+                HttpStatusCode.Unauthorized => (false, 
+                    $"401 Unauthorized: Invalid credentials or API token.\n" +
+                    $"URL: {url}\n" +
+                    $"Auth: {(_http.DefaultRequestHeaders.Authorization?.Scheme)}\n" +
+                    $"Response: {(body.Length > 200 ? body.Substring(0, 200) : body)}"),
+                
+                HttpStatusCode.Forbidden => (false, 
+                    $"403 Forbidden: Account may be locked or lacks permissions.\n" +
+                    $"Response: {(body.Length > 200 ? body.Substring(0, 200) : body)}"),
+                
+                _ => (false, $"{response.StatusCode}: {response.ReasonPhrase}\n{body}")
             };
+        }
+        catch (Exception ex)
+        {
+            return (false, $"Connection error: {ex.Message}");
+        }
+    }
 
-            _http = new HttpClient(handler, disposeHandler: true)
+    return (false, "Could not reach Jira API endpoints.");
+}
+        public async Task<(bool ok, System.Net.HttpStatusCode status, string? body)> ProbeAsync(CancellationToken ct = default)
+        {
+            // Try both v3 and v2 to cover Cloud/Server differences
+            var urls = new[]
             {
-                Timeout = timeout ?? TimeSpan.FromSeconds(20)
-            };
+            $"{_baseUrl}/rest/api/3/myself",
+            $"{_baseUrl}/rest/api/2/myself"
+        };
 
-            var basic = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{email}:{apiToken}"));
-            _authBasic = new AuthenticationHeaderValue("Basic", basic);
-            _authBearer = new AuthenticationHeaderValue("Bearer", apiToken);
+            foreach (var url in urls)
+            {
+                try
+                {
+                    using var resp = await _http.GetAsync(url, ct).ConfigureAwait(false);
+                    var content = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                    if (resp.IsSuccessStatusCode)
+                        return (true, resp.StatusCode, content);
 
-            _http.DefaultRequestHeaders.Authorization = _authBasic; // start with Basic
-            _http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-            _http.DefaultRequestHeaders.UserAgent.ParseAdd("SprintReportGenerator/1.0");
+                    // If 404 on first, try v2; otherwise return the failure immediately
+                    if (!(resp.StatusCode == System.Net.HttpStatusCode.NotFound && url.Contains("/api/3/")))
+                        return (false, resp.StatusCode, content);
+                }
+                catch (Exception ex)
+                {
+                    // Surface transport/SSL/proxy errors as a synthetic failure
+                    return (false, 0, ex.Message);
+                }
+            }
+
+            return (false, System.Net.HttpStatusCode.NotFound, "myself endpoint not found on /2 or /3.");
         }
 
         // DTO order: Project, Type, Key, Summary, Status
@@ -306,7 +381,6 @@ namespace SprintReportGenerator.Services
                 }
             }
 
-            // 3) If we have official keys -> query strictly by keys
             // 3) If we have official keys -> query strictly by keys AND sprint
             if (officialKeys.Count > 0)
             {

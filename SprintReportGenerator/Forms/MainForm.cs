@@ -111,15 +111,15 @@ namespace SprintReportGenerator.Forms
                 string sprintStartTr = string.Empty, sprintEndTr = string.Empty;
 
                 // Fetch issues and sprint date range (best effort)
-                if (!string.IsNullOrWhiteSpace(_settings.Email) &&
+                if (!string.IsNullOrWhiteSpace(_settings.UserName) &&
                     !string.IsNullOrWhiteSpace(_settings.JiraUrl) &&
-                    !string.IsNullOrWhiteSpace(_settings.EncApiToken))
+                    !string.IsNullOrWhiteSpace(_settings.EncSecret))
                 {
-                    var token = _store.Unprotect(_settings.EncApiToken);
-                    if (!string.IsNullOrWhiteSpace(token))
+                    var secret = _store.Unprotect(_settings.EncSecret);
+                    if (!string.IsNullOrWhiteSpace(secret))
                     {
                         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(25));
-                        using var client = new JiraClient(_settings.JiraUrl.TrimEnd('/'), _settings.Email, token);
+                        using var client = new JiraClient(_settings.JiraUrl.TrimEnd('/'), _settings.UserName, secret);
 
                         // STRICT sprint fetch, only Bug/Improvement/Story
                         var allowedTypes = new[] { "Bug", "Improvement", "Story" };
@@ -242,9 +242,9 @@ namespace SprintReportGenerator.Forms
                 return;
             }
 
-            if (string.IsNullOrWhiteSpace(_settings.Email) ||
+            if (string.IsNullOrWhiteSpace(_settings.UserName) ||
                 string.IsNullOrWhiteSpace(_settings.JiraUrl) ||
-                string.IsNullOrWhiteSpace(_settings.EncApiToken))
+                string.IsNullOrWhiteSpace(_settings.EncSecret))
             {
                 lvIssues.Items.Clear();
                 SetJiraStatus("Jira: Missing settings", Color.OrangeRed);
@@ -257,8 +257,8 @@ namespace SprintReportGenerator.Forms
 
             try
             {
-                var tokenPlain = _store.Unprotect(_settings.EncApiToken);
-                if (string.IsNullOrWhiteSpace(tokenPlain))
+                var secretPlain = _store.Unprotect(_settings.EncSecret);
+                if (string.IsNullOrWhiteSpace(secretPlain))
                 {
                     ShowProgress(false);
                     SetJiraStatus("Jira: Token decrypt failed", Color.IndianRed);
@@ -267,7 +267,7 @@ namespace SprintReportGenerator.Forms
                     return;
                 }
 
-                using var client = new JiraClient(_settings.JiraUrl.TrimEnd('/'), _settings.Email, tokenPlain);
+                using var client = new JiraClient(_settings.JiraUrl.TrimEnd('/'), _settings.UserName, secretPlain);
 
                 IReadOnlyList<JiraIssue> issues;
 
