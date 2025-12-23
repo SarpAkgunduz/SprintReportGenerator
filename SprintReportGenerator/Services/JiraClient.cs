@@ -198,11 +198,6 @@ namespace SprintReportGenerator.Services
         public async Task<IReadOnlyList<JiraIssue>> SearchIssuesByProjectAndSprintAsync(
             string project, string sprintText, IEnumerable<string>? issueTypes, CancellationToken ct = default)
         {
-            var dbg = new List<string>
-            {
-                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] STRICT SEARCH project='{project}', sprintText='{sprintText}'"
-            };
-
             static string Esc(string? s) => (s ?? string.Empty).Replace("\"", "\\\"");
             static int? Num(string? s)
             {
@@ -224,7 +219,7 @@ namespace SprintReportGenerator.Services
                 {
                     var boardsUrl = $"{_baseUrl}/rest/agile/1.0/board?projectKeyOrId={Uri.EscapeDataString(project)}&maxResults=50";
                     var (bCode, boardsJson) = await GetWithAuthFallbackAsync(boardsUrl, ct);
-                    dbg.Add($"boards GET {bCode}");
+                    
 
                     if (bCode == HttpStatusCode.OK)
                     {
@@ -250,7 +245,6 @@ namespace SprintReportGenerator.Services
                                         $"?state=active,closed,future&maxResults={pageSize}&startAt={startAt}";
 
                                     using var sResp = await _http.GetAsync(sUrl, ct).ConfigureAwait(false);
-                                    dbg.Add($"sprints(board={bid}) GET {sResp.StatusCode} startAt={startAt}");
                                     if (!sResp.IsSuccessStatusCode) break;
 
                                     var sJson = await sResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
@@ -289,8 +283,6 @@ namespace SprintReportGenerator.Services
                                         }
                                     }
 
-                                    dbg.Add($"  -> pageCount={pageCount}");
-
                                     bool isLast = rootPage.TryGetProperty("isLast", out var il) && il.GetBoolean();
                                     if (isLast || pageCount == 0) break;
 
@@ -309,12 +301,10 @@ namespace SprintReportGenerator.Services
             }
             catch (Exception ex)
             {
-                dbg.Add("candidate collection EX: " + ex.Message);
+                
             }
 
-            dbg.Add($"candidates: {candidates.Count}");
-            foreach (var c in candidates.Take(5))
-                dbg.Add($" - cand board={c.boardId} sprint={c.sprintId} name='{c.name}' start={c.start} end={c.end}");
+            
 
             // Helper: try get official keys for a candidate
             async Task<HashSet<string>> TrySprintReportKeysAsync(int boardId, long sprintId)
@@ -324,7 +314,7 @@ namespace SprintReportGenerator.Services
                 {
                     var url = $"{_baseUrl}/rest/greenhopper/1.0/rapid/charts/sprintreport?rapidViewId={boardId}&sprintId={sprintId}";
                     var (rCode, rText) = await GetWithAuthFallbackAsync(url, ct);
-                    dbg.Add($"sprintreport(board={boardId},sprint={sprintId}) -> {rCode}");
+                    
                     if (rCode != HttpStatusCode.OK) return keys;
 
                     using var doc = JsonDocument.Parse(rText);
@@ -334,7 +324,7 @@ namespace SprintReportGenerator.Services
                 }
                 catch (Exception ex)
                 {
-                    dbg.Add("sprintreport EX: " + ex.Message);
+                    
                 }
                 return keys;
             }
@@ -351,9 +341,9 @@ namespace SprintReportGenerator.Services
                 {
                     chosenBoard = cand.boardId;
                     chosenSprint = cand.sprintId;
-                    dbg.Add($"CHOSEN_BY_KEYS board={chosenBoard} sprint={chosenSprint} name='{cand.name}' start={cand.start:o} end={cand.end:o}");
+                    
                     officialKeys = k;
-                    dbg.Add($"CHOSEN by keys: board={chosenBoard}, sprint={chosenSprint}, keys={officialKeys.Count}");
+                    
                     break;
                 }
             }
@@ -366,7 +356,7 @@ namespace SprintReportGenerator.Services
                     .First();
                 chosenBoard = pick.boardId;
                 chosenSprint = pick.sprintId;
-                dbg.Add($"CHOSEN by fallback-candidate: board={chosenBoard}, sprint={chosenSprint}");
+                
             }
 
             // If still nothing, we try a generic resolve (older logic)
@@ -377,14 +367,13 @@ namespace SprintReportGenerator.Services
                 {
                     chosenBoard = -1; // unknown
                     chosenSprint = sid.Value;
-                    dbg.Add($"CHOSEN by ResolveSprintId fallback: sprint={chosenSprint}");
+                    
                 }
             }
 
             // 3) If we have official keys -> query strictly by keys AND sprint
             if (officialKeys.Count > 0)
             {
-                dbg.Add("STRICT by official key set (enforce sprint in JQL)");
 
                 var filtered = new List<JiraIssue>();
                 var keys = officialKeys.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
@@ -392,7 +381,6 @@ namespace SprintReportGenerator.Services
                 if (!chosenSprint.HasValue)
                 {
                     // normalde olmamalı; yine de fallback
-                    dbg.Add("WARN: chosenSprint missing while we have keys; falling back to key-in only.");
                     filtered = (await FetchIssuesByKeysAsync(keys, ct)).ToList();
                 }
                 else
@@ -405,7 +393,7 @@ namespace SprintReportGenerator.Services
                             $"{projectClause} AND sprint = {chosenSprint.Value} " +
                             $"AND key in ({string.Join(", ", slice)}){typeClause} ORDER BY updated DESC";
 
-                        dbg.Add("STRICT JQL: " + jql);
+                        
 
                         var part = await SearchIssuesAsync(jql, ct).ConfigureAwait(false);
                         if (part.Count > 0) filtered.AddRange(part);
@@ -427,8 +415,7 @@ namespace SprintReportGenerator.Services
                 }
 
                 var ret = result.ToList();
-                dbg.Add($"RETURN keys={officialKeys.Count}, after filters={ret.Count}");
-                WriteStrictDebug(dbg, officialKeys);
+                
                 return ret;
             }
 
@@ -438,25 +425,21 @@ namespace SprintReportGenerator.Services
             if (chosenSprint.HasValue)
             {
                 var jql = $"{projectClause} AND sprint = {chosenSprint.Value}{typeClause} ORDER BY updated DESC";
-                dbg.Add("FALLBACK JQL: " + jql);
                 results = (await SearchIssuesAsync(jql, ct).ConfigureAwait(false)).ToList();
             }
             else if (int.TryParse(sprintText, out var sidNumeric))
             {
                 // sprintText sayısal ise ismi değil ID kabul et
                 var jql = $"{projectClause} AND sprint = {sidNumeric}{typeClause} ORDER BY updated DESC";
-                dbg.Add("FALLBACK JQL (by numeric): " + jql);
                 results = (await SearchIssuesAsync(jql, ct).ConfigureAwait(false)).ToList();
             }
             else if (!string.IsNullOrWhiteSpace(sprintText))
             {
                 var jql = $"{projectClause} AND sprint = \"{Esc(sprintText)}\"{typeClause} ORDER BY updated DESC";
-                dbg.Add("FALLBACK JQL (by name): " + jql);
                 results = (await SearchIssuesAsync(jql, ct).ConfigureAwait(false)).ToList();
             }
 
-            dbg.Add($"RETURN fallback count={results.Count}");
-            WriteStrictDebug(dbg, null);
+            
             return results;
         }
 
@@ -609,7 +592,7 @@ namespace SprintReportGenerator.Services
                     var summary = fields.ValueKind == JsonValueKind.Object && fields.TryGetProperty("summary", out var s)
                                     ? s.GetString() ?? string.Empty : string.Empty;
                     var status = fields.ValueKind == JsonValueKind.Object && fields.TryGetProperty("status", out var st)
-                                    ? (st.TryGetProperty("name", out var sn) ? sn.GetString() ?? string.Empty : string.Empty)
+                                    ? (st.TryGetPrope       rty("name", out var sn) ? sn.GetString() ?? string.Empty : string.Empty)
                                     : string.Empty;
                     var type = fields.ValueKind == JsonValueKind.Object && fields.TryGetProperty("issuetype", out var it)
                                     ? (it.TryGetProperty("name", out var tn) ? tn.GetString() ?? string.Empty : string.Empty)
@@ -741,20 +724,6 @@ namespace SprintReportGenerator.Services
             }
         }
 
-        private static void WriteStrictDebug(List<string> lines, HashSet<string>? keys)
-        {
-            try
-            {
-                if (keys != null)
-                {
-                    lines.Add($"officialKeys count={keys.Count}");
-                    lines.Add("officialKeys sample: " + string.Join(", ", keys.Take(20)));
-                }
-                var path = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "strict_debug.txt");
-                System.IO.File.AppendAllText(path, string.Join(Environment.NewLine, lines) + Environment.NewLine + new string('-', 80) + Environment.NewLine);
-            }
-            catch { /* ignore logging failures */ }
-        }
         public void Dispose()
         {
             _http.Dispose();
