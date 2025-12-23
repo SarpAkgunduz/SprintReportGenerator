@@ -273,6 +273,16 @@ namespace SprintReportGenerator.Services
                 items.Where(i => i.Type?.Equals("Story", StringComparison.OrdinalIgnoreCase) == true),
                 "Testler sırasında");
 
+            int inQaCount = items.Count(i => IsInQaStatus(i.Status));
+            if (inQaCount < 1)
+            {
+                body.AppendChild(MakeBulletParagraph("Sprint kapsamında testi tamamlanamayan kayıt bulunmamaktadır"));
+            }
+            else
+            {
+                body.AppendChild(MakeBulletParagraph($"Sprint kapsamında testi tamamlanamayan {inQaCount} adet kayıt bulunmaktadır"));
+            }
+
             body.AppendChild(BlankLine()); // spacing after summary block
         }
 

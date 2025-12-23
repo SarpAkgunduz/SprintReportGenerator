@@ -618,6 +618,7 @@ namespace SprintReportGenerator.Services
                                     ? (pj.TryGetProperty("name", out var pn) ? pn.GetString() ?? string.Empty : string.Empty)
                                     : string.Empty;
 
+
                     list.Add(new JiraIssue(project, type, key, summary, status));
                 }
 
