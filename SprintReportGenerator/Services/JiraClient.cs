@@ -400,7 +400,7 @@ namespace SprintReportGenerator.Services
                     }
                 }
 
-                // güvenlik için proje filtrelemesi
+                // For security project filter, double-check project match
                 IEnumerable<JiraIssue> result = filtered.Where(i =>
                     (projectLooksLikeKey
                         ? (i.Key?.StartsWith(project + "-", StringComparison.OrdinalIgnoreCase) ?? false)
@@ -592,7 +592,7 @@ namespace SprintReportGenerator.Services
                     var summary = fields.ValueKind == JsonValueKind.Object && fields.TryGetProperty("summary", out var s)
                                     ? s.GetString() ?? string.Empty : string.Empty;
                     var status = fields.ValueKind == JsonValueKind.Object && fields.TryGetProperty("status", out var st)
-                                    ? (st.TryGetPrope       rty("name", out var sn) ? sn.GetString() ?? string.Empty : string.Empty)
+                                    ? (st.TryGetProperty("name", out var sn) ? sn.GetString() ?? string.Empty : string.Empty)
                                     : string.Empty;
                     var type = fields.ValueKind == JsonValueKind.Object && fields.TryGetProperty("issuetype", out var it)
                                     ? (it.TryGetProperty("name", out var tn) ? tn.GetString() ?? string.Empty : string.Empty)

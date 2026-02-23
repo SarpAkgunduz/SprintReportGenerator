@@ -1,11 +1,12 @@
 ﻿// Services/OpenXmlTemplateProcessor.cs
+using DocumentFormat.OpenXml;
+using DocumentFormat.OpenXml.Packaging;
+using DocumentFormat.OpenXml.Wordprocessing;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using DocumentFormat.OpenXml;
-using DocumentFormat.OpenXml.Packaging;
-using DocumentFormat.OpenXml.Wordprocessing;
+using System.Text.RegularExpressions;
 using static SprintReportGenerator.Services.JiraClient;
 
 namespace SprintReportGenerator.Services
@@ -25,7 +26,9 @@ namespace SprintReportGenerator.Services
 
             string outDir = Path.GetDirectoryName(templatePath) ?? AppDomain.CurrentDomain.BaseDirectory;
             string safeProj = (data.ProjectName ?? "Project").Replace(Path.GetInvalidFileNameChars(), '_');
-            string safeSprint = (data.SprintName ?? "Sprint").Replace(Path.GetInvalidFileNameChars(), '_');
+            var sprintMatch = Regex.Match(data.SprintName ?? "", @"\d+");
+            string safeSprint = (sprintMatch.Success ? sprintMatch.Value : data.SprintName ?? "Sprint")
+                .Replace(Path.GetInvalidFileNameChars(), '_');
 
             string output = Path.Combine(outDir, $"Sprint {safeSprint} {safeProj} Test Kapanış Raporu.docx");
             File.Copy(templatePath, output, true);
@@ -47,7 +50,7 @@ namespace SprintReportGenerator.Services
                 ReplaceToken(body, "{{PROJECT}}", data.ProjectName ?? "");
                 ReplaceToken(body, "{{FORM_DATE}}", data.ReportDate ?? "");
                 ReplaceToken(body, "{{MEMBER_NAME}}", data.MemberName ?? "");
-                ReplaceToken(body, "{{SPRINT}}", data.SprintName ?? "");
+                ReplaceToken(body, "{{SPRINT}}", Regex.Match(data.SprintName ?? "", @"\d+").Value);
 
                 // >>> Keep TOC alone on first page: start content on a NEW page
                 AppendPageBreak(body);
@@ -245,7 +248,12 @@ namespace SprintReportGenerator.Services
             void TypeBlock(string label, IEnumerable<JiraIssue> src, string prefixText)
             {
                 var list = src.ToList();
-                if (list.Count == 0) return;
+                if (list.Count == 0)
+                {
+                    body.AppendChild(MakeBulletParagraph($"Sprint kapsamında {label} kaydı bulunmamaktadır."));
+                    return;
+                }
+                
 
                 int op = list.Count(i => IsOpenStatus(i.Status));
                 int cl = list.Count(i => IsClosedStatus(i.Status));
@@ -265,7 +273,7 @@ namespace SprintReportGenerator.Services
                 items.Where(i => i.Type?.Equals("Bug", StringComparison.OrdinalIgnoreCase) == true),
                 "Testler sırasında");
 
-            TypeBlock("iyileştirme talebi",
+            TypeBlock("İyileştirme talebi",
                 items.Where(i => i.Type?.Equals("Improvement", StringComparison.OrdinalIgnoreCase) == true),
                 "Testler sırasında");
 
