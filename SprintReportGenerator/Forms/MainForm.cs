@@ -1,181 +1,173 @@
-﻿// Forms/MainForm.cs
+﻿using System.Diagnostics;
+using System.Globalization;
 using SprintReportGenerator.Models;
 using SprintReportGenerator.Services;
 using SprintReportGenerator.Services.Interfaces;
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.Drawing;
-using System.Globalization;
-using System.IO;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Windows.Forms;
-using JiraIssue = SprintReportGenerator.Services.JiraClient.JiraIssue;
 
 namespace SprintReportGenerator.Forms
 {
     public partial class MainForm : Form
     {
+        private static readonly CultureInfo Turkish = new CultureInfo("tr-TR");
+        private static readonly TimeSpan JiraTimeout = TimeSpan.FromSeconds(60);
+
         private readonly AppSettings _settings;
+        private readonly string _secret;
         private readonly OpenXmlTemplateProcessor _report = new OpenXmlTemplateProcessor();
         private readonly ISettingsStore _store = new JsonSettingsStore();
+        private readonly System.Windows.Forms.Timer _autoPreviewTimer = new System.Windows.Forms.Timer { Interval = 500 };
 
-        private ListView lvIssues;
+        private CancellationTokenSource? _previewCts;
+        private int _previewVersion;
 
-        private System.Windows.Forms.Timer _autoPreviewTimer;
-        private CancellationTokenSource? _activeLoadCts;
-
-        public MainForm(AppSettings settings)
+        public MainForm(AppSettings settings, string secret)
         {
             InitializeComponent();
+            FormBranding.Apply(this);
+
             _settings = settings ?? new AppSettings();
+            _secret = secret ?? string.Empty;
 
-            const string AppTitle = "Open Sprint Generator";
-            this.Text = AppTitle;
-            try { this.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
-
-            btnGenerate.Click -= btnGenerate_Click;
-            btnGenerate.Click += btnGenerate_Click;
-
-            lvIssues = issueList;
-
-            lvIssues.View = View.Details;
-            lvIssues.FullRowSelect = true;
-            lvIssues.GridLines = true;
-            lvIssues.MultiSelect = false;
-            lvIssues.HideSelection = false;
-            lvIssues.UseCompatibleStateImageBehavior = false;
-
-            lvIssues.Columns.Clear();
-            lvIssues.Columns.Add("Issue Type", 160, HorizontalAlignment.Left);
-            lvIssues.Columns.Add("Key", 140, HorizontalAlignment.Left);
+            issueList.View = View.Details;
+            issueList.FullRowSelect = true;
+            issueList.GridLines = true;
+            issueList.MultiSelect = false;
+            issueList.HideSelection = false;
+            issueList.Columns.Clear();
+            issueList.Columns.Add("Issue Type", 100, HorizontalAlignment.Left);
+            issueList.Columns.Add("Key", 120, HorizontalAlignment.Left);
 
             tsProg.Style = ProgressBarStyle.Marquee;
-            tsProg.MarqueeAnimationSpeed = 30;
-            tsProg.Visible = false;
+            ShowProgress(false);
 
-            if (txtSprintName != null) txtSprintName.Text = _settings.SprintName ?? string.Empty;
-            if (txtMemberName != null) txtMemberName.Text = _settings.MemberName ?? string.Empty;
-            if (txtProjectName != null) txtProjectName.Text = _settings.ProjectName ?? string.Empty;
+            txtSprintName.Text = _settings.SprintName;
+            txtMemberName.Text = _settings.MemberName;
+            txtProjectName.Text = _settings.ProjectName;
             chkOpenAfterGenerate.Checked = _settings.OpenAfterGenerate;
 
-            _autoPreviewTimer = new System.Windows.Forms.Timer { Interval = 500 };
-            _autoPreviewTimer.Tick += async (_, __) =>
+            _autoPreviewTimer.Tick += async (_, _) =>
             {
                 _autoPreviewTimer.Stop();
                 await LoadIssuesAsync();
             };
 
-            if (txtProjectName != null) txtProjectName.TextChanged += ProjectOrSprint_Changed;
-            if (txtSprintName != null) txtSprintName.TextChanged += ProjectOrSprint_Changed;
+            txtProjectName.TextChanged += ProjectOrSprint_Changed;
+            txtSprintName.TextChanged += ProjectOrSprint_Changed;
 
-            this.Shown += async (_, __) => await LoadIssuesAsync();
+            Shown += async (_, _) => await LoadIssuesAsync();
+            FormClosed += (_, _) =>
+            {
+                _autoPreviewTimer.Dispose();
+                _previewCts?.Cancel();
+                _previewCts?.Dispose();
+            };
         }
+
+        private string ProjectNameText => txtProjectName.Text.Trim();
+        private string SprintNameText => txtSprintName.Text.Trim();
+        private string MemberNameText => txtMemberName.Text.Trim();
+
+        private bool HasCredentials =>
+            !string.IsNullOrWhiteSpace(_settings.UserName) &&
+            !string.IsNullOrWhiteSpace(_settings.JiraUrl) &&
+            !string.IsNullOrWhiteSpace(_secret);
+
+        private JiraClient CreateClient() =>
+            new JiraClient(_settings.JiraUrl, _settings.UserName, _secret,
+                useBasicAuth: JiraClient.ShouldUseBasicAuth(_settings.JiraUrl, _settings.IsBasic),
+                timeout: TimeSpan.FromSeconds(30));
 
         // =========================
         // Generate report
         // =========================
         private async void btnGenerate_Click(object? sender, EventArgs e)
         {
+            string sprintName = SprintNameText, memberName = MemberNameText, projectName = ProjectNameText;
+
+            var (ok, error) = ValidationService.ValidateMainFormInputs(sprintName, memberName, projectName);
+            if (!ok)
+            {
+                MessageBox.Show(error, "Validation Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (!HasCredentials)
+            {
+                MessageBox.Show("Jira credentials are missing. Please restart the application and log in again.",
+                    "Missing Credentials", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            string template = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "report_template.docx");
+            if (!File.Exists(template))
+            {
+                MessageBox.Show($"Template not found:\n{template}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            _settings.SprintName = sprintName;
+            _settings.MemberName = memberName;
+            _settings.ProjectName = projectName;
+            _settings.OpenAfterGenerate = chkOpenAfterGenerate.Checked;
+            _store.Save(_settings);
+
+            btnGenerate.Enabled = false;
+            ShowProgress(true);
+            SetJiraStatus("Jira: Fetching sprint...", Color.DodgerBlue);
+
             try
             {
-                string sprintName = txtSprintName?.Text?.Trim() ?? string.Empty;
-                string memberName = txtMemberName?.Text?.Trim() ?? string.Empty;
-                string projectName = txtProjectName?.Text?.Trim() ?? string.Empty;
-
-                var (ok, error) = ValidationService.ValidateMainFormInputs(sprintName, memberName, projectName);
-                if (!ok)
+                SprintSearchResult result;
+                using (var cts = new CancellationTokenSource(JiraTimeout))
+                using (var client = CreateClient())
                 {
-                    MessageBox.Show(error, "Validation Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    result = await client.SearchIssuesByProjectAndSprintAsync(
+                        projectName, sprintName, IssueTypes.ReportTypes, cts.Token);
+                }
+
+                FillIssues(result.Issues);
+                SetJiraStatus($"Jira: {result.Issues.Count} issues", result.Issues.Count > 0 ? Color.ForestGreen : Color.Firebrick);
+
+                // An empty report is almost always a wrong project/sprint name — don't produce it silently
+                if (result.Issues.Count == 0 &&
+                    MessageBox.Show($"No Bug/Improvement/Story issues were found for \"{projectName}\" / \"{sprintName}\".\n" +
+                                    "Generate an empty report anyway?",
+                        "No Issues", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
                     return;
-                }
-
-                _settings.SprintName = sprintName;
-                _settings.MemberName = memberName;
-                _settings.ProjectName = projectName;
-                _settings.OpenAfterGenerate = chkOpenAfterGenerate.Checked;
-                _store.Save(_settings);
-
-                string exeDir = AppDomain.CurrentDomain.BaseDirectory;
-                string template = Path.Combine(exeDir, "report_template.docx");
-                if (!File.Exists(template))
-                {
-                    MessageBox.Show($"Template not found:\n{template}", "Error",
-                        MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }
-
-                IReadOnlyList<JiraIssue> issues = Array.Empty<JiraIssue>();
-                string sprintStartTr = string.Empty, sprintEndTr = string.Empty;
-
-                // Fetch issues and sprint date range (best effort)
-                if (!string.IsNullOrWhiteSpace(_settings.UserName) &&
-                    !string.IsNullOrWhiteSpace(_settings.JiraUrl) &&
-                    !string.IsNullOrWhiteSpace(_settings.EncSecret))
-                {
-                    var secret = _store.Unprotect(_settings.EncSecret);
-                    if (!string.IsNullOrWhiteSpace(secret))
-                    {
-                        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(25));
-                        using var client = new JiraClient(_settings.JiraUrl.TrimEnd('/'), _settings.UserName, secret);
-
-                        // STRICT sprint fetch, only Bug/Improvement/Story
-                        var allowedTypes = new[] { "Bug", "Improvement", "Story" };
-                        var raw = await client
-                            .SearchIssuesByProjectAndSprintAsync(projectName, sprintName, allowedTypes, cts.Token)
-                            .ConfigureAwait(true);
-
-                        issues = raw;
-
-                        // derive project KEY from first issue key if available, else use user input
-                        string projectKeyOrId = projectName;
-                        var keyCandidate = raw.FirstOrDefault()?.Key ?? string.Empty;
-                        var dash = keyCandidate.IndexOf('-');
-                        if (dash > 0) projectKeyOrId = keyCandidate.Substring(0, dash);
-
-                        try
-                        {
-                            var (start, end) = await client
-                                .TryGetSprintDatesAsync(projectKeyOrId, sprintName, cts.Token)
-                                .ConfigureAwait(true);
-
-                            var tr = new CultureInfo("tr-TR");
-                            if (start.HasValue) sprintStartTr = start.Value.ToString("d MMMM yyyy", tr);
-                            if (end.HasValue) sprintEndTr = end.Value.ToString("d MMMM yyyy", tr);
-                        }
-                        catch { /* ignore */ }
-                    }
-                }
 
                 var data = new TemplateData
                 {
                     ReportDate = DateTime.Today.ToString("dd.MM.yyyy", CultureInfo.InvariantCulture),
-                    ProjectName = _settings.ProjectName ?? string.Empty,
-                    MemberName = _settings.MemberName ?? string.Empty,
-                    SprintName = _settings.SprintName ?? string.Empty,
-                    SprintStartDate = sprintStartTr,
-                    SprintEndDate = sprintEndTr
+                    ProjectName = projectName,
+                    MemberName = memberName,
+                    SprintName = sprintName,
+                    SprintStartDate = result.Sprint?.Start?.ToString("d MMMM yyyy", Turkish) ?? string.Empty,
+                    SprintEndDate = result.Sprint?.End?.ToString("d MMMM yyyy", Turkish) ?? string.Empty
                 };
 
-                string output = _report.Generate(template, data, issues);
+                string output = _report.Generate(template, data, result.Issues);
 
                 MessageBox.Show($"Report created successfully:\n{output}", "Success",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
 
                 if (chkOpenAfterGenerate.Checked && File.Exists(output))
-                {
-                    Process.Start(new ProcessStartInfo
-                    {
-                        FileName = output,
-                        UseShellExecute = true
-                    });
-                }
+                    Process.Start(new ProcessStartInfo { FileName = output, UseShellExecute = true });
+            }
+            catch (TaskCanceledException)
+            {
+                SetJiraStatus("Jira: timeout", Color.OrangeRed);
+                MessageBox.Show("Jira did not answer in time. Please try again.", "Timeout",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            catch (HttpRequestException ex)
+            {
+                SetJiraStatus("Jira: network/SSL error", Color.IndianRed);
+                MessageBox.Show($"Network/SSL error:\n{ex.Message}", "Network Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             catch (IOException ioEx)
             {
-                MessageBox.Show($"File error:\n{ioEx.Message}", "Error",
+                MessageBox.Show($"File error (is the report already open in Word?):\n{ioEx.Message}", "Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             catch (Exception ex)
@@ -183,14 +175,16 @@ namespace SprintReportGenerator.Forms
                 MessageBox.Show($"Unexpected error:\n{ex.Message}", "Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+            finally
+            {
+                btnGenerate.Enabled = true;
+                ShowProgress(false);
+            }
         }
 
         // =========================
         // Auto-preview
         // =========================
-
-        private string ProjectNameText => txtProjectName?.Text?.Trim() ?? string.Empty;
-        private string SprintNameText => txtSprintName?.Text?.Trim() ?? string.Empty;
 
         private void SetJiraStatus(string text, Color color)
         {
@@ -210,112 +204,110 @@ namespace SprintReportGenerator.Forms
             _autoPreviewTimer.Start();
         }
 
-        private void FillIssues(IEnumerable<JiraIssue>? issues)
+        private void FillIssues(IEnumerable<JiraIssue> issues)
         {
-            lvIssues.BeginUpdate();
-            lvIssues.Items.Clear();
-
-            if (issues != null)
+            issueList.BeginUpdate();
+            try
             {
+                issueList.Items.Clear();
                 foreach (var issue in issues)
+                    issueList.Items.Add(new ListViewItem(new[] { issue.Type, issue.Key }));
+
+                FitColumns();
+            }
+            finally
+            {
+                issueList.EndUpdate();
+            }
+        }
+
+        /// <summary>
+        /// Sizes every column to max(header, content). (ColumnContent alone collapses
+        /// columns to almost zero width when the list is empty or the values are short.)
+        /// </summary>
+        private void FitColumns()
+        {
+            foreach (ColumnHeader column in issueList.Columns)
+            {
+                column.AutoResize(ColumnHeaderAutoResizeStyle.HeaderSize);
+                int headerWidth = column.Width;
+                if (issueList.Items.Count > 0)
                 {
-                    var item = new ListViewItem(issue.Type ?? string.Empty);
-                    item.SubItems.Add(issue.Key ?? string.Empty);
-                    lvIssues.Items.Add(item);
+                    column.AutoResize(ColumnHeaderAutoResizeStyle.ColumnContent);
+                    column.Width = Math.Max(column.Width, headerWidth);
                 }
             }
-
-            lvIssues.AutoResizeColumns(ColumnHeaderAutoResizeStyle.ColumnContent);
-            lvIssues.EndUpdate();
         }
 
         private async Task LoadIssuesAsync()
         {
-            _activeLoadCts?.Cancel();
-            _activeLoadCts = new CancellationTokenSource(TimeSpan.FromSeconds(25));
-            var token = _activeLoadCts.Token;
+            // Supersede any running preview; only the latest one may touch the UI
+            _previewCts?.Cancel();
+            _previewCts?.Dispose();
+            _previewCts = new CancellationTokenSource(JiraTimeout);
+            var token = _previewCts.Token;
+            int version = ++_previewVersion;
+            ShowProgress(false);
 
             if (string.IsNullOrWhiteSpace(ProjectNameText))
             {
-                lvIssues.Items.Clear();
+                FillIssues(Array.Empty<JiraIssue>());
                 SetJiraStatus("Jira: waiting for Project...", Color.DodgerBlue);
                 return;
             }
 
-            if (string.IsNullOrWhiteSpace(_settings.UserName) ||
-                string.IsNullOrWhiteSpace(_settings.JiraUrl) ||
-                string.IsNullOrWhiteSpace(_settings.EncSecret))
+            if (!HasCredentials)
             {
-                lvIssues.Items.Clear();
-                SetJiraStatus("Jira: Missing settings", Color.OrangeRed);
+                FillIssues(Array.Empty<JiraIssue>());
+                SetJiraStatus("Jira: Missing credentials", Color.OrangeRed);
                 return;
             }
 
             ShowProgress(true);
-            lvIssues.Items.Clear();
+            FillIssues(Array.Empty<JiraIssue>());
             SetJiraStatus("Jira: Loading issues...", Color.DodgerBlue);
 
             try
             {
-                var secretPlain = _store.Unprotect(_settings.EncSecret);
-                if (string.IsNullOrWhiteSpace(secretPlain))
-                {
-                    ShowProgress(false);
-                    SetJiraStatus("Jira: Token decrypt failed", Color.IndianRed);
-                    MessageBox.Show("Stored token could not be decrypted. Please login again.",
-                        "Token Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }
-
-                using var client = new JiraClient(_settings.JiraUrl.TrimEnd('/'), _settings.UserName, secretPlain);
-
                 IReadOnlyList<JiraIssue> issues;
-
-                if (!string.IsNullOrWhiteSpace(SprintNameText))
+                using (var client = CreateClient())
                 {
-                    var types = new[] { "Bug", "Improvement", "Story" };
-                    issues = await client.SearchIssuesByProjectAndSprintAsync(
-                        ProjectNameText, SprintNameText, types, token);
-                }
-                else
-                {
-                    issues = await client.SearchIssuesByProjectAsync(
-                        ProjectNameText, take: 50, issueTypes: null, ct: token);
+                    issues = string.IsNullOrWhiteSpace(SprintNameText)
+                        ? await client.SearchIssuesByProjectAsync(ProjectNameText, take: 50, ct: token)
+                        : (await client.SearchIssuesByProjectAndSprintAsync(
+                              ProjectNameText, SprintNameText, IssueTypes.ReportTypes, token)).Issues;
                 }
 
-                if (token.IsCancellationRequested) return;
-
-                ShowProgress(false);
-
-                var count = issues?.Count ?? 0;
-                if (count == 0)
-                {
-                    SetJiraStatus("Jira: 0 issues", Color.Firebrick);
-                    lvIssues.Items.Clear();
-                    return;
-                }
+                if (version != _previewVersion) return;
 
                 FillIssues(issues);
-                SetJiraStatus($"Jira: {count} issues", Color.ForestGreen);
+                SetJiraStatus($"Jira: {issues.Count} issues", issues.Count > 0 ? Color.ForestGreen : Color.Firebrick);
             }
-            catch (TaskCanceledException)
+            catch (OperationCanceledException) when (version != _previewVersion)
             {
-                ShowProgress(false);
-                SetJiraStatus("Jira: canceled", Color.OrangeRed);
+                // superseded by a newer preview – nothing to report
             }
-            catch (System.Net.Http.HttpRequestException ex)
+            catch (OperationCanceledException)
             {
-                ShowProgress(false);
+                SetJiraStatus("Jira: timeout", Color.OrangeRed);
+            }
+            catch (HttpRequestException ex)
+            {
+                if (version != _previewVersion) return;
                 SetJiraStatus("Jira: network/SSL error", Color.IndianRed);
                 MessageBox.Show($"Network/SSL error:\n{ex.Message}", "Network Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             catch (Exception ex)
             {
-                ShowProgress(false);
+                if (version != _previewVersion) return;
                 SetJiraStatus("Jira: error", Color.IndianRed);
                 MessageBox.Show($"Unexpected error:\n{ex.Message}", "Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                if (version == _previewVersion) ShowProgress(false);
             }
         }
     }

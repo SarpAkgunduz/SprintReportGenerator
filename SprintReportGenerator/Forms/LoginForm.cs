@@ -1,97 +1,85 @@
 ﻿using SprintReportGenerator.Models;
 using SprintReportGenerator.Services;
-using SprintReportGenerator.Services.Interfaces;
-using System;
-using System.Windows.Forms;
-
 
 namespace SprintReportGenerator.Forms
 {
     public partial class LoginForm : Form
     {
         private readonly JsonSettingsStore _store = new JsonSettingsStore();
-        private AppSettings _settings = new AppSettings();
+
+        /// <summary>Settings saved after a successful login.</summary>
+        public AppSettings Settings { get; private set; } = new AppSettings();
+
+        /// <summary>Plain password / token of the successful login (kept in memory only).</summary>
+        public string Secret { get; private set; } = string.Empty;
 
         public LoginForm()
         {
             InitializeComponent();
+            FormBranding.Apply(this);
             LoadSettings();
-
-            const string AppTitle = "Open Sprint Generator";
-            this.Text = AppTitle;
-            try { this.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { /* ignore */ }
         }
 
         private void LoadSettings()
         {
-            _settings = _store.Load();
+            Settings = _store.Load();
 
-            txtUserName.Text = _settings.UserName ?? string.Empty;  // ✅ TextBox adı değişmedi (UI component)
-            txtJiraUrl.Text = _settings.JiraUrl ?? string.Empty;
-            chkRememberMe.Checked = _settings.RememberMe;
-
-            // restore mode and credential
-            chkIsBasic.Checked = _settings.IsBasic;
-
-            var plain = _store.Unprotect(_settings.EncSecret);
-            txtSecret.Text = plain ?? string.Empty;
+            txtUserName.Text = Settings.UserName;
+            txtJiraUrl.Text = Settings.JiraUrl;
+            chkRememberMe.Checked = Settings.RememberMe;
+            chkIsBasic.Checked = Settings.IsBasic;
+            txtSecret.Text = _store.Unprotect(Settings.EncSecret);
         }
 
-        // Change the event handler to be async
         private async void btnContinue_Click(object sender, EventArgs e)
         {
-            var username = txtUserName.Text?.Trim();  // ✅ email → username
-            var jira = txtJiraUrl.Text?.Trim();
+            var userName = txtUserName.Text.Trim();
+            var jiraUrl = txtJiraUrl.Text.Trim().TrimEnd('/');
+            var secret = txtSecret.Text.Trim();
+            bool passwordMode = chkIsBasic.Checked;
 
-            // 2) basic validation
-            var (ok, error) = ValidationService.ValidateLoginFormInputs(username, jira);  // ✅ email → username
+            var (ok, error) = ValidationService.ValidateLoginFormInputs(userName, jiraUrl);
             if (!ok)
             {
                 MessageBox.Show(error, "Validation Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
-            // 3) Take credential from the single textbox (token or password)
-            var secretRaw = txtSecret.Text?.Trim() ?? string.Empty;
-            if (string.IsNullOrEmpty(secretRaw))
+
+            if (secret.Length == 0)
             {
                 MessageBox.Show("Please enter your API token or password.",
                     "Missing Credential", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
-            // 4) Optional guard: Jira Cloud does not accept password-based Basic Auth
-            bool isCloud = (jira ?? string.Empty).IndexOf("atlassian.net", StringComparison.OrdinalIgnoreCase) >= 0;
-            if (chkIsBasic.Checked && isCloud)
+            // Jira Cloud does not accept password-based Basic Auth
+            if (passwordMode && JiraClient.IsCloudUrl(jiraUrl))
             {
-                MessageBox.Show(
-                    "Jira Cloud requires an API token. Password-based Basic Auth is not supported.",
+                MessageBox.Show("Jira Cloud requires an API token. Password-based Basic Auth is not supported.",
                     "Unsupported Mode", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
-            // 5) Online authentication check (block MainForm unless it succeeds)
+            // Online authentication check (MainForm is blocked unless it succeeds)
+            btnContinue.Enabled = false;
+            UseWaitCursor = true;
             try
             {
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-                using var client = new JiraClient(
-                    (jira ?? string.Empty).TrimEnd('/'), 
-                    username!,  // ✅ email → username
-                    secretRaw, 
-                    useBasicAuth: chkIsBasic.Checked  
-                );
+                using var client = new JiraClient(jiraUrl, userName, secret,
+                    useBasicAuth: JiraClient.ShouldUseBasicAuth(jiraUrl, passwordMode));
 
-                var authResult = await client.ValidateAsync(cts.Token).ConfigureAwait(true);
-                if (!authResult.success)
+                var (success, errorMessage) = await client.ValidateAsync(cts.Token);
+                if (!success)
                 {
-                    MessageBox.Show(
-                        chkIsBasic.Checked
-                            ? $"Authentication failed with password.{(string.IsNullOrEmpty(authResult.errorMessage) ? "" : "\n" + authResult.errorMessage)}"
-                            : $"Authentication failed with API token.{(string.IsNullOrEmpty(authResult.errorMessage) ? "" : "\n" + authResult.errorMessage)}",
+                    var mode = passwordMode ? "password" : "API token";
+                    MessageBox.Show($"Authentication failed with {mode}." +
+                                    (string.IsNullOrEmpty(errorMessage) ? "" : "\n" + errorMessage),
                         "Authentication Failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
             }
-            catch (System.Net.Http.HttpRequestException ex)
+            catch (HttpRequestException ex)
             {
                 MessageBox.Show($"Network/SSL error:\n{ex.Message}", "Network Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -109,26 +97,22 @@ namespace SprintReportGenerator.Forms
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
-
-            _settings.UserName = username ?? string.Empty;  // ✅ email → username (kayıt için)
-            _settings.JiraUrl = (jira ?? string.Empty).TrimEnd('/');
-            _settings.RememberMe = chkRememberMe.Checked;
-            _settings.IsBasic = chkIsBasic.Checked;
-
-            if (_settings.RememberMe)
+            finally
             {
-                var raw = txtSecret.Text?.Trim() ?? string.Empty;
-                _settings.EncSecret = _store.Protect(raw);
-            }
-            else
-            {
-                _settings.EncSecret = string.Empty;
+                btnContinue.Enabled = true;
+                UseWaitCursor = false;
             }
 
-            _store.Save(_settings);
+            Settings.UserName = userName;
+            Settings.JiraUrl = jiraUrl;
+            Settings.RememberMe = chkRememberMe.Checked;
+            Settings.IsBasic = passwordMode;
+            Settings.EncSecret = Settings.RememberMe ? _store.Protect(secret) : string.Empty;
+            _store.Save(Settings);
 
-            this.DialogResult = DialogResult.OK;
-            this.Close();
+            Secret = secret;
+            DialogResult = DialogResult.OK;
+            Close();
         }
     }
 }

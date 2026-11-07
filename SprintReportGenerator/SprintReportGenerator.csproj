@@ -21,8 +21,10 @@
     <PackageReference Include="DocumentFormat.OpenXml" Version="3.3.0" />
   </ItemGroup>
 
+  <!-- The report template is not tracked in git; copy it next to the exe when it exists locally -->
   <ItemGroup>
-    <Folder Include="Templates\" />
+    <None Include="..\report_template.docx" Condition="Exists('..\report_template.docx')"
+          Link="report_template.docx" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
  <ItemGroup>
