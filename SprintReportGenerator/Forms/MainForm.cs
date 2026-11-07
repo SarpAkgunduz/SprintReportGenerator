@@ -111,8 +111,7 @@ namespace SprintReportGenerator.Forms
             _settings.OpenAfterGenerate = chkOpenAfterGenerate.Checked;
             _store.Save(_settings);
 
-            btnGenerate.Enabled = false;
-            ShowProgress(true);
+            SetGenerating(true);
             SetJiraStatus("Jira: Fetching sprint...", Color.DodgerBlue);
 
             try
@@ -177,8 +176,7 @@ namespace SprintReportGenerator.Forms
             }
             finally
             {
-                btnGenerate.Enabled = true;
-                ShowProgress(false);
+                SetGenerating(false);
             }
         }
 
@@ -190,6 +188,26 @@ namespace SprintReportGenerator.Forms
         {
             tslJira.Text = text;
             tslJira.ForeColor = color;
+        }
+
+        /// <summary>
+        /// While a report is generated: stop/cancel the auto-preview and lock the inputs,
+        /// so a preview can neither start nor hide the progress bar in the middle of it.
+        /// </summary>
+        private void SetGenerating(bool busy)
+        {
+            if (busy)
+            {
+                _autoPreviewTimer.Stop();
+                _previewCts?.Cancel();
+                _previewVersion++; // a preview that is still running must not touch the UI anymore
+            }
+
+            btnGenerate.Enabled = !busy;
+            txtProjectName.ReadOnly = busy;
+            txtSprintName.ReadOnly = busy;
+            txtMemberName.ReadOnly = busy;
+            ShowProgress(busy);
         }
 
         private void ShowProgress(bool on)
